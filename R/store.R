@@ -1,197 +1,131 @@
 #' Create and connect to a vector store
 #'
-#' @param location filepath, or `:memory:`
+#' @details
+#'
+#' ## Store versions
+#'
+#' **Version 2 – documents with chunk ranges** (default)
+#'
+#' With `version = 2`, ragnar stores each document once and records the start
+#' and end positions of its chunks. This provides strong support for overlapping
+#' chunk ranges with de-overlapping at retrieval, and generally allows
+#' retrieving arbitrary ranges from source documents, but does not support
+#' modifying chunks directly before insertion. Chunks can be augmented via the
+#' `context` field and with additional fields passed to `extra_cols`. The
+#' easiest way to prepare `chunks` for `version = 2` is with
+#' `read_as_markdown()` and `markdown_chunk()`.
+#'
+#' **Version 1 – flat chunks**
+#'
+#' With `version = 1`, ragnar keeps all chunks in a single table. This lets you
+#' easily modify chunk text before insertion. However, dynamic rechunking
+#' (de-overlapping) or extracting arbitrary ranges from source documents is not
+#' supported, since the original full documents are no longer available. Chunks
+#' can be augmented by modifying the chunk text directly (e.g., with `glue()`).
+#' Additionally, if you intend to call `ragnar_store_update()`, it is your
+#' responsibility to provide `rlang::hash(original_full_document)` with each
+#' chunk. The easiest way to prepare `chunks` for `version = 1` is with
+#' `ragnar_read()` and `ragnar_chunk()`.
+#'
+#' @param location filepath, or `:memory:`. Location can also be a database name
+#'   specified with `md:dbname`, in this case the database will be created in
+#'   MotherDuck after a connection is established.
 #' @param embed A function that is called with a character vector and returns a
 #'   matrix of embeddings. Note this function will be serialized and then
 #'   deserialized in new R sessions, so it cannot reference to any objects in
 #'   the global or parent environments. Make sure to namespace all function
 #'   calls with `::`. If additional R objects must be available in the function,
-#'   you can optionally supply a `carrier::crate()` with packaged data.
-#'   It can also be `NULL` for stores that don't need to embed their texts, for example,
-#'   if only using FTS algorithms such as [ragnar_retrieve_bm25()].
+#'   you can optionally supply a `carrier::crate()` with packaged data. It can
+#'   also be `NULL` for stores that don't need to embed their texts, for
+#'   example, if only using FTS algorithms such as [ragnar_retrieve_bm25()].
 #' @param embedding_size integer
 #' @param overwrite logical, what to do if `location` already exists
 #' @param ... Unused. Must be empty.
-#' @param extra_cols A zero row data frame used to specify additional columns that
-#'  should be added to the store. Such columns can be used for adding additional
-#'  context when retrieving. See the examples for more information.
-#'  [vctrs::vec_cast()] is used to consistently perform type checks and casts
-#'  when inserting with [ragnar_store_insert()].
+#' @param extra_cols A zero row data frame used to specify additional columns
+#'   that should be added to the store. Such columns can be used for adding
+#'   additional context when retrieving. See the examples for more information.
+#'   [vctrs::vec_cast()] is used to consistently perform type checks and casts
+#'   when inserting with [ragnar_store_insert()].
 #' @param name A unique name for the store. Must match the `^[a-zA-Z0-9_-]+$`
-#'  regex. Used by [ragnar_register_tool_retrieve()] for registering tools.
+#'   regex. Used by [ragnar_register_tool_retrieve()] for registering tools.
+#' @param title A title for the store, used by [ragnar_register_tool_retrieve()]
+#'   when the store is registered with an [ellmer::Chat] object.
 #'
+#' @param version integer. The version of the store to create. See details.
+#'
+#' @returns a `RagnarStore` object
+#' @export
 #' @examples
 #' # A store with a dummy embedding
 #' store <- ragnar_store_create(
 #'   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
+#'   version = 1
 #' )
 #' ragnar_store_insert(store, data.frame(text = "hello"))
 #'
 #' # A store with a schema. When inserting into this store, users need to
-#' # provide a `area` column.
+#' # provide an `area` column.
 #' store <- ragnar_store_create(
 #'   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
 #'   extra_cols = data.frame(area = character()),
+#'   version = 1
 #' )
 #' ragnar_store_insert(store, data.frame(text = "hello", area = "rag"))
 #'
 #' # If you already have a data.frame with chunks that will be inserted into
-#' # the store, you can quickly create a suitable store with:
+#' # the store, you can quickly create a suitable store with `vec_ptype()`:
 #' chunks <- data.frame(text = letters, area = "rag")
 #' store <- ragnar_store_create(
 #'   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
 #'   extra_cols = vctrs::vec_ptype(chunks),
+#'   version = 1
 #' )
 #' ragnar_store_insert(store, chunks)
 #'
-#' @returns a `DuckDBRagnarStore` object
-#' @export
+#' # version = 2 (the default) has support for deoverlapping
+#' store <- ragnar_store_create(
+#'   # if embed = NULL, then only bm25 search is used (not vss)
+#'   embed = NULL
+#' )
+#' doc <- MarkdownDocument(
+#'   paste0(letters, collapse = ""),
+#'   origin = "/some/where"
+#' )
+#' chunks <- markdown_chunk(doc, target_size = 3, target_overlap = 2 / 3)
+#' chunks$context <- substring(chunks$text, 1, 1)
+#' chunks
+#' ragnar_store_insert(store, chunks)
+#' ragnar_store_build_index(store)
+#'
+#' ragnar_retrieve(store, "abc bcd xyz", deoverlap = FALSE)
+#' ragnar_retrieve(store, "abc bcd xyz", deoverlap = TRUE)
 ragnar_store_create <- function(
   location = ":memory:",
   embed = embed_ollama(),
+  ...,
   embedding_size = ncol(embed("foo")),
   overwrite = FALSE,
-  ...,
   extra_cols = NULL,
-  name = NULL
+  name = NULL,
+  title = NULL,
+  version = 2
 ) {
-  rlang::check_dots_empty()
-
-  if (is.null(name)) {
-    name <- unique_store_name()
-  }
-  stopifnot(grepl("^[a-zA-Z0-9_-]+$", name))
-
-  if (any(file.exists(c(location, location.wal <- paste0(location, ".wal"))))) {
-    if (overwrite) {
-      unlink(c(location, location.wal), force = TRUE)
-    } else {
-      stop("File already exists: ", location)
-    }
-  }
-  con <- dbConnect(duckdb::duckdb(), dbdir = location, array = "matrix")
-
-  default_schema <- vctrs::vec_ptype(data_frame(
-    origin = character(0),
-    hash = character(0),
-    text = character(0)
-  ))
-
-  if (is.null(embed)) {
-    embedding_size <- NULL
-  } else {
-    check_number_whole(embedding_size, min = 0)
-    embedding_size <- as.integer(embedding_size)
-
-    if (!inherits(embed, "crate")) {
-      environment(embed) <- baseenv()
-      embed <- rlang::zap_srcref(embed)
-    }
-
-    default_schema$embedding <- matrix(
-      numeric(0),
-      nrow = 0,
-      ncol = embedding_size
-    )
-  }
-
-  if (is.null(extra_cols)) {
-    schema <- default_schema
-  } else {
-    stopifnot(
-      is.data.frame(extra_cols)
-    )
-
-    schema <- vctrs::vec_ptype(extra_cols)
-
-    # schema can't contain the default schema with different types.
-    # It's fine if it doesn't contain all the columns from the default schema,
-    # in this case we just add them.
-    cols <- names(schema)
-
-    if ("id" %in% cols) {
-      cli::cli_abort("{.arg schema} must not contain a column called {.arg id}")
-    }
-
-    for (nm in names(default_schema)) {
-      if (nm %in% cols) {
-        stopifnot(
-          identical(schema[[nm]], default_schema[[nm]])
-        )
-      } else {
-        schema[[nm]] <- default_schema[[nm]]
-      }
-    }
-  }
-
-  metadata <- tibble::tibble(
-    embedding_size,
-    embed_func = blob::blob(serialize(embed, NULL)),
-    schema = blob::blob(serialize(schema, NULL)),
-    name = name
+  check_number_whole(version)
+  create <- switch(
+    as.integer(version),
+    ragnar_store_create_v1,
+    ragnar_store_create_v2
   )
-
-  if (overwrite)
-    dbExecute(
-      con,
-      glue::trim(
-        "
-      DROP TABLE IF EXISTS metadata;
-      DROP TABLE IF EXISTS chunks;
-      DROP SEQUENCE IF EXISTS id_sequence;
-      "
-      )
-    )
-
-  dbWriteTable(con, "metadata", metadata)
-
-  # read back in embed, so any problems with an R function that doesn't serialize
-  # correctly flush out early.
-  metadata <- dbReadTable(con, "metadata")
-  embed <- unserialize(metadata$embed_func[[1L]])
-  schema <- unserialize(metadata$schema[[1]])
-  name <- metadata$name
-
-  # attach function to externalptr, so we can retreive it from just the connection.
-  ptr <- con@conn_ref
-  attr(ptr, "embed_function") <- embed
-
-  # duckdb R interface does not support array columns yet,
-  # so we hand-write the sql.
-  columns <- map2(names(schema), schema, function(nm, type) {
-    # TODO add support for more data types!
-    dbtype <- if (is.character(type)) {
-      "VARCHAR"
-    } else if (is.matrix(type) && is.integer(type)) {
-      glue::glue("INTEGER[{ncol(type)}]")
-    } else if (is.matrix(type) && is.double(type)) {
-      glue::glue("FLOAT[{ncol(type)}]")
-    } else if (is.integer(type)) {
-      "INTEGER"
-    } else if (is.double(type)) {
-      "FLOAT"
-    } else {
-      cli::cli_abort(
-        "Unexpected type for column {.val {nm}}: {.cls {class(type)}} / {.cls {typeof(type)}}"
-      )
-    }
-
-    glue("{nm} {dbtype}")
-  })
-
-  dbExecute(
-    con,
-    glue(
-      "
-    CREATE SEQUENCE id_sequence START 1;
-    CREATE TABLE chunks (
-      id INTEGER DEFAULT nextval('id_sequence'),
-      {stri_c(columns, collapse = ',')}
-    )"
-    )
+  create(
+    location = location,
+    embed = embed,
+    embedding_size = embedding_size,
+    overwrite = overwrite,
+    ...,
+    extra_cols = extra_cols,
+    name = name,
+    title = title
   )
-
-  DuckDBRagnarStore(embed = embed, schema = schema, .con = con, name = name)
 }
 
 unique_store_name <- function() {
@@ -199,154 +133,164 @@ unique_store_name <- function() {
   sprintf("store_%03d", the$current_store_id)
 }
 
-#' Connect to `RagnarStore`
-#'
-#' @param location string, a filepath location.
+process_embed_func <- function(embed) {
+  if (inherits(embed, "crate")) {
+    return(embed)
+  }
+  environment(embed) <- baseenv()
+  embed <- rlang::zap_srcref(embed)
+
+  embed_func_names <- grep(
+    "^embed_",
+    getNamespaceExports("ragnar"),
+    value = TRUE
+  )
+
+  walker <- function(x) {
+    switch(
+      typeof(x),
+      list = {
+        x <- lapply(x, walker)
+      },
+      language = {
+        if (rlang::is_call(x, embed_func_names, ns = c("", "ragnar"))) {
+          name <- rlang::call_name(x)
+          fn <- get(name)
+          ox <- x
+          x <- rlang::call_match(x, fn, defaults = FALSE, dots_expand = FALSE)
+          x <- as.list(x)
+
+          # ensure 'model' is explicit arg embedded in call
+          if (!"model" %in% names(x)) {
+            x["model"] <- formals(fn)["model"]
+          }
+
+          # preserve `...` if they were present in the call (call_match() removes them)
+          if (any(map_lgl(as.list(ox), identical, quote(...)))) {
+            x <- c(x, quote(...))
+          }
+          x <- as.call(x)
+
+          # ensure the call is namespaced
+          if (is.null(rlang::call_ns(x))) {
+            x[[1L]] <- call("::", quote(ragnar), as.symbol(name))
+          }
+        } else {
+          x <- as.call(lapply(x, walker))
+        }
+      },
+      x
+    )
+    x
+  }
+
+  body(embed) <- walker(body(embed))
+  embed
+}
+
+
+check_store_overwrite <- function(location, overwrite) {
+  check_bool(overwrite)
+  if (location == ":memory:" || is_motherduck_location(location)) {
+    return()
+  }
+
+  paths <- c(location, location.wal <- paste0(location, ".wal"))
+  if (any(file.exists(paths))) {
+    if (overwrite) {
+      unlink(c(location, location.wal), force = TRUE)
+    } else {
+      stop("File already exists: ", location)
+    }
+  }
+}
+
+
 #' @param ... unused; must be empty.
 #' @param read_only logical, whether the returned connection can be used to
 #'   modify the store.
-#' @param build_index logical, whether to call `ragnar_store_build_index()` when
-#'   creating the connection
 #'
-#' @returns a `RagnarStore` object.
 #' @export
-#'
-#' @rdname rangar_store_create
+#' @rdname ragnar_store_create
 ragnar_store_connect <- function(
-  location = ":memory:",
+  location,
   ...,
-  read_only = FALSE,
-  build_index = FALSE
+  read_only = TRUE
 ) {
   check_dots_empty()
-  # mode = c("retrieve", "insert")
-  # mode <- match.arg(mode)
-  # read_only <- mode == "retrieve"
 
-  con <- dbConnect(
-    duckdb::duckdb(),
-    dbdir = location,
-    read_only = read_only,
-    array = "matrix"
-  )
+  if (is_motherduck_location(location)) {
+    con <- motherduck_connection(location, create = FALSE, overwrite = FALSE)
+  } else {
+    con <- dbConnect(
+      duckdb::duckdb(),
+      dbdir = location,
+      read_only = read_only,
+      array = "matrix"
+    )
+  }
 
-  # can't use dbExistsTable() because internally it runs:
-  # > dbGetQuery(conn, sqlInterpolate(conn, "SELECT * FROM ? WHERE FALSE", dbQuoteIdentifier(conn, name)))
-  # which fails with:
-  # > Error in dbSendQuery(conn, statement, ...) :
-  # >  rapi_prepare: Unknown column type for prepare: FLOAT[384]
-  if (!all(c("chunks", "metadata") %in% dbListTables(con))) {
+  tables <- dbListTables(con)
+  if (all(c("documents", "embeddings", "metadata") %in% tables)) {
+    version <- 2L
+  } else if (all(c("chunks", "metadata") %in% tables)) {
+    version <- 1L
+  } else {
     stop("Store must be created with ragnar_store_create()")
   }
+
   dbExecute(con, "INSTALL fts; INSTALL vss;")
   dbExecute(con, "LOAD fts; LOAD vss;")
 
   metadata <- dbReadTable(con, "metadata")
   embed <- unserialize(metadata$embed_func[[1L]])
-  schema <- unserialize(metadata$schema[[1L]])
+  schema <- switch(version, unserialize(metadata$schema[[1L]]), NULL)
   name <- metadata$name %||% unique_store_name()
 
-  # attach function to externalptr, so we can retreive it from just the connection.
+  # attach function to externalptr, so we can retrieve it from just the connection.
   ptr <- con@conn_ref
   attr(ptr, "embed_function") <- embed
 
-  if (build_index) ragnar_store_build_index(con)
-
-  DuckDBRagnarStore(embed = embed, schema = schema, .con = con, name = name)
+  DuckDBRagnarStore(
+    embed = embed,
+    schema = schema,
+    con = con,
+    name = name,
+    title = metadata$title,
+    version = version
+  )
 }
+
 
 #' Inserts or updates chunks in a `RagnarStore`
 #'
 #' @inheritParams ragnar_store_insert
+#' @param chunks Content to update. The precise input structure depends on
+#'   `store@version`. See Details.
 #' @details
-#' `chunks` must be a data frame containing `origin` and `hash` columns.
-#' We first filter out chunks for which `origin` and `hash` are already in the store.
-#' If an `origin` is in the store, but with a different `hash`, we all of its chunks
-#' with the new chunks. Otherwise, a regular insert is performed.
 #'
-#' This can help spending less time computing embeddings for chunks that are already in the store.
+#' **Store Version 2**
+#'
+#' `chunks` must be `MarkdownDocumentChunks` object.
+#'
+#' **Store Version 1**
+#'
+#' `chunks` must be a data frame containing `origin`, `hash`, and `text`
+#' columns. We first filter out chunks for which `origin` and `hash` are already
+#' in the store. If an `origin` is in the store, but with a different `hash`, we
+#' replace all of its chunks with the new chunks. Otherwise, a regular insert is
+#' performed.
+#'
+#' This can help avoid needing to compute embeddings for chunks that are already
+#' in the store.
 #'
 #' @returns `store`, invisibly.
 #' @export
 ragnar_store_update <- function(store, chunks) {
-  # ?? swap arg order? piping in df will be more common...
-  # -- can do df |> ragnar_store_insert(store = store)
-  if (!S7_inherits(store, RagnarStore)) {
-    stop("store must be a RagnarStore")
-  }
-
-  if (!"origin" %in% names(chunks) || !"hash" %in% names(chunks)) {
-    cli::cli_abort(c(
-      "{.arg chunks} must have {.code origin} and {.code hash} column, got {.val {names(chunks)}}.",
-      i = "Use {.code ragnar_store_insert()} to insert chunks without origin and hash."
-    ))
-  }
-
-  # Before computing the embeddings, and inserting we want make sure we check
-  # if the the document is already in the store. If it's, we want to make sure
-  # it really changed.
-  # If the embedding is already computed this will be handled by the INSERT INTO
-  # statement that handles conflicts.
-
-  tryCatch(
-    {
-      # Insert the new chunks into a temporary table
-      DBI::dbWriteTable(
-        store@.con,
-        "tmp_chunks",
-        chunks |> dplyr::select("origin", "hash") |> dplyr::distinct(),
-        temporary = TRUE,
-        overwrite = TRUE
-      )
-
-      # We want to insert into the chunks table all chunks whose origin and hash
-      # are not already in the chunks table.
-      chunks_to_insert <- DBI::dbGetQuery(
-        store@.con,
-        "SELECT * FROM tmp_chunks
-      EXCEPT
-      SELECT DISTINCT origin, hash FROM chunks"
-      )
-
-      # Only leave the chunks that will be inserted.
-      chunks <- dplyr::left_join(
-        chunks_to_insert,
-        chunks,
-        by = c("origin", "hash")
-      )
-      # We've already done everything we needed, we can simply throw out the transaction.
-      dbExecute(store@.con, "DROP TABLE tmp_chunks;")
-    },
-    error = function(e) {
-      cli::cli_abort("Failed to filter chunks to insert", parent = e)
-    }
-  )
-
-  if (!nrow(chunks)) {
-    return(invisible(store))
-  }
-
-  dbExecute(store@.con, "BEGIN TRANSACTION;")
-  tryCatch(
-    {
-      # Remove rows that have the same origin as those that will be included
-      origins <- DBI::dbQuoteString(store@.con, unique(chunks$origin)) |>
-        stri_c(collapse = ", ")
-      dbExecute(
-        store@.con,
-        glue("DELETE FROM chunks WHERE origin IN ({origins})")
-      )
-
-      # Insert the new chunks into the store
-      ragnar_store_insert(store, chunks)
-
-      # Finally commit
-      dbExecute(store@.con, "COMMIT;")
-    },
-    error = function(e) {
-      dbExecute(store@.con, "ROLLBACK;")
-      cli::cli_abort("Failed to update the store", parent = e)
-    }
+  switch(
+    store@version,
+    ragnar_store_update_v1(store, chunks),
+    ragnar_store_update_v2(store, chunks)
   )
   invisible(store)
 }
@@ -361,93 +305,13 @@ ragnar_store_update <- function(store, chunks) {
 #' @returns `store`, invisibly.
 #' @export
 ragnar_store_insert <- function(store, chunks) {
-  # ?? swap arg order? piping in df will be more common...
-  # -- can do df |> ragnar_store_insert(store = store)
-  if (!S7_inherits(store, RagnarStore)) {
-    stop("store must be a RagnarStore")
-  }
-
-  if (is.character(chunks)) {
-    chunks <- data_frame(text = chunks)
-  }
-
-  if (!nrow(chunks)) {
-    # No chunks, just return them
-    return(invisible(store))
-  }
-
-  if (is.null(chunks$origin)) {
-    chunks$origin <- NA_character_
-  }
-
-  if (is.null(chunks$hash)) {
-    chunks$hash <- vapply(chunks$text, rlang::hash, character(1))
-  }
-
-  stopifnot(
-    is.data.frame(chunks),
-    is.character(chunks$text),
-    is.character(chunks$origin),
-    is.character(chunks$hash)
+  switch(
+    store@version,
+    ragnar_store_insert_v1(store, chunks),
+    ragnar_store_insert_v2(store, chunks)
   )
-
-  if (!is.null(store@embed) && !"embedding" %in% names(chunks)) {
-    chunks$embedding <- store@embed(chunks$text)
-    stopifnot(
-      is.matrix(chunks$embedding)
-      # ncol(df$embedding) == store@embedding_size
-    )
-  }
-
-  # Validate that chunks share ptype with schema
-  # Its NOT OK for chunks to miss columns that don't match the schema
-  schema <- store@schema
-  if (!all(names(schema) %in% names(chunks))) {
-    cli::cli_abort(c(
-      "Columns in chunks do not match schema",
-      x = "Missing columns: {.val {setdiff(names(schema), names(chunks))}}"
-    ))
-  }
-
-  # Ideally this would use dbWriteTable, but we can't really because it currently
-  # doesn't support array columns.
-  cols <- imap(schema, function(ptype, name) {
-    # Ensures that the column in chunks has the expected ptype. (or at least
-    # something that can be cast to the correct ptype with no loss)
-    col <- vctrs::vec_cast(
-      chunks[[name]],
-      ptype,
-      x_arg = glue::glue("chunks${name}")
-    )
-
-    if (is.matrix(col) && is.numeric(col)) {
-      stri_c(
-        "array_value(",
-        col |> asplit(1) |> map_chr(stri_flatten, ", "),
-        ")"
-      )
-    } else if (is.character(col)) {
-      DBI::dbQuoteString(store@.con, col)
-    } else if (is.numeric(col)) {
-      DBI::dbQuoteLiteral(store@.con, col)
-    } else {
-      cli::cli_abort("Unsupported type {.cls {class(col)}}")
-    }
-  })
-
-  rows <- stri_c("(", do.call(\(...) stri_c(..., sep = ","), cols), ")")
-  rows <- stri_c(rows, collapse = ",\n")
-
-  insert_statement <- sprintf(
-    "INSERT INTO chunks (%s) VALUES \n%s;",
-    stri_c(names(schema), collapse = ", "),
-    rows
-  )
-
-  dbExecute(store@.con, insert_statement)
-
-  invisible(store)
 }
+
 
 #' Build a Ragnar Store index
 #'
@@ -461,59 +325,71 @@ ragnar_store_insert <- function(store, chunks) {
 #' @returns `store`, invisibly.
 #' @export
 ragnar_store_build_index <- function(store, type = c("vss", "fts")) {
-  if (S7_inherits(store, DuckDBRagnarStore)) con <- store@.con else if (
-    methods::is(store, "DBIConnection")
+  switch(
+    store@version,
+    ragnar_store_build_index_v1(store, type),
+    ragnar_store_build_index_v2(store, type)
   )
-    con <- store else stop("`store` must be a RagnarStore")
-
-  if ("vss" %in% type && !is.null(store@embed)) {
-    # TODO: duckdb has support for three different distance metrics that can be
-    # selected when building the index: l2sq, cosine, and ip. Expose these as options
-    # in the R interface. https://duckdb.org/docs/stable/core_extensions/vss#usage
-    dbExecute(con, "INSTALL vss;")
-    dbExecute(con, "LOAD vss;")
-    dbExecute(
-      con,
-      paste(
-        "SET hnsw_enable_experimental_persistence = true;",
-        "DROP INDEX IF EXISTS my_hnsw_index;",
-        "CREATE INDEX my_hnsw_index ON chunks USING HNSW (embedding);"
-      )
-    )
-  }
-
-  if ("fts" %in% type) {
-    dbExecute(con, "INSTALL fts;")
-    dbExecute(con, "LOAD fts;")
-    # fts index builder takes many options, e.g., stemmer, stopwords, etc.
-    # Expose a way to pass along args. https://duckdb.org/docs/stable/core_extensions/full_text_search
-    dbExecute(
-      con,
-      "PRAGMA create_fts_index('chunks', 'id', 'text', overwrite = 1);"
-    )
-  }
-
-  invisible(store)
 }
 
 # @export
-RagnarStore <- new_class(
-  "RagnarStore",
+#
+# The plan is to export RagnarStore when we're ready for users to subclass
+# to implement other store types/backends. Note: before doing this, we are
+# also considering transitioning to R6 for the store class object, since a
+# store is inherently stateful and S7 is better suited to stateless objects.
+RagnarStore := new_class(
   properties = list(
     embed = S7::new_union(class_function, NULL),
-    schema = class_data.frame,
-    name = class_character
+    schema = NULL | class_data.frame,
+    name = class_character,
+    title = S7::new_union(NULL, class_character)
   ),
   abstract = TRUE
 )
 
-DuckDBRagnarStore <- new_class(
-  "DuckDBRagnarStore",
-  RagnarStore,
+DuckDBRagnarStore := new_class(
+  parent = RagnarStore,
   properties = list(
-    .con = methods::getClass("DBIConnection")
+    con = methods::getClass("DBIConnection"),
+    version = class_integer,
+    .con = new_property(
+      getter = function(self) {
+        warning("@.con renamed to @con, please update your code")
+        self@con
+      }
+    )
   )
 )
+
+local({
+  method(print, DuckDBRagnarStore) <- function(x, ...) {
+    embed <- deparse1(x@embed)
+    embed <- sub("function ?\\(", "\\\\(", embed)
+    embed <- sub(") +", ") ", embed)
+
+    # TODO: restore @schema:
+    cat(glue(
+      '
+    <ragnar::DuckDBRagnarStore>
+     @ embed   : {embed}
+     @ name    : {x@name}
+     @ title   : {x@title %||% "NULL"}
+     @ con     : <DBI::DBIConnection>
+     @ version : {x@version}
+    '
+    ))
+  }
+})
+
+#' @importFrom dplyr tbl sql arrange collect
+local({
+  method(tbl, ragnar:::DuckDBRagnarStore) <-
+    function(src, from = "chunks", ...) {
+      tbl(src@con, from)
+    }
+})
+
 
 #' Launches the Ragnar Inspector Tool
 #'
@@ -531,9 +407,3 @@ ragnar_store_inspect <- function(store, ...) {
   })
   invisible(NULL)
 }
-
-#' @importFrom dplyr tbl sql arrange collect
-method(tbl, ragnar:::DuckDBRagnarStore) <- function(src, from = "chunks", ...) {
-  tbl(src@.con, from)
-}
-rm(tbl)

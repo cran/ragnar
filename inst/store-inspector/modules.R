@@ -1,4 +1,4 @@
-storeInspectorUI <- function(id) {
+storeInspectorUI <- function(id, search_types = c("BM25", "VSS")) {
   ns <- \(i) shiny::NS(id, i)
 
   shiny::tags$html(
@@ -11,7 +11,7 @@ storeInspectorUI <- function(id) {
       ),
     ),
     shiny::tags$body(
-      class = "flex flex-col max-h-screen min-h-screen h-full",
+      class = "flex flex-col max-h-screen min-h-screen h-full bg-white",
       shiny::div(
         class = "flex-none bg-blue-500 p-2 gap-2",
         shiny::div(
@@ -34,7 +34,7 @@ storeInspectorUI <- function(id) {
             placeholder = "Search the store ..."
           )
         ),
-        switchInput(ns("search_type"), "VSS", "BM25")
+        switchInput(ns("search_type"), search_types)
       ),
       shiny::div(
         class = "flex grow p-2 gap-2 h-full overflow-hidden",
@@ -44,10 +44,10 @@ storeInspectorUI <- function(id) {
           shiny::div(
             class = "flex flex-row justify-between pr-1 border-b pb-2 border-gray-200 items-center gap-1",
             shiny::h3("Document preview", class = "text-md font-mono"),
-            switchInput(ns("markdown"), "Preview", "Raw Text")
+            switchInput(ns("markdown"), c("Preview", "Raw Text"))
           ),
           shiny::uiOutput(
-            class = "h-full",
+            class = "h-full overflow-hidden",
             ns("preview")
           )
         )
@@ -59,16 +59,20 @@ storeInspectorUI <- function(id) {
 storeInspectorServer <- function(id, store) {
   shiny::moduleServer(id, function(input, output, session) {
     query <- shiny::debounce(shiny::reactive(input$query), 1000)
-    is_vss <- switchServer("search_type")
+    search_type <- switchServer("search_type")
 
     documents <- shiny::reactive({
       if (is.null(query()) || nchar(query()) <= 0) {
-        return(data.frame())
+        d <- dplyr::tbl(store) |>
+          head(100) |>
+          dplyr::collect()
+        attr(d, "no_filter") <- TRUE
+        return(d)
       }
 
       tryCatch(
         {
-          if (is_vss()) {
+          if (search_type() == "VSS") {
             ragnar::ragnar_retrieve_vss(store, query(), top_k = 10)
           } else {
             ragnar::ragnar_retrieve_bm25(store, query(), top_k = 10)
@@ -85,31 +89,57 @@ storeInspectorServer <- function(id, store) {
     })
 
     selectedDocumentId <- listDocumentsServer("document_list", documents)
-    selectedDocumentText <- shiny::reactive({
+
+    selectedDocument <- shiny::reactive({
       if (is.null(selectedDocumentId())) {
         return(NULL)
       }
       docs <- documents()
-      docs$text[docs$id == selectedDocumentId()]
+      docs[docs$chunk_id == selectedDocumentId(), , drop = FALSE]
     })
-    is_markdown <- switchServer("markdown")
+
+    preview_type <- switchServer("markdown")
 
     output$preview <- shiny::renderUI({
-      if (is.null(selectedDocumentText())) {
+      if (is.null(selectedDocument()$text) || nrow(selectedDocument()) == 0) {
         return(tags$div("Select a document to preview"))
       }
 
-      if (is_markdown()) {
+      preview <- if (is.null(preview_type()) || preview_type() == "Preview") {
         shiny::tags$iframe(
-          class = "size-full",
-          srcdoc = shiny::markdown(selectedDocumentText())
+          class = "size-full text-pretty",
+          srcdoc = shiny::markdown(selectedDocument()$text)
         )
       } else {
         shiny::tags$pre(
-          class = "text-xs",
-          selectedDocumentText()
+          class = "text-xs text-pretty",
+          selectedDocument()$text
         )
       }
+
+      metadata <- selectedDocument() |>
+        dplyr::select(
+          dplyr::all_of(names(store@schema)),
+          -dplyr::any_of(c("doc_id", "chunk_id", "start", "end", "embedding"))
+        )
+
+      shiny::div(
+        class = "flex flex-col gap-2 size-full overflow-hidden",
+        shiny::div(
+          class = "border-b pb-2 border-gray-200 max-h-1/3 overflow-y-auto",
+          shiny::pre(
+            class = "text-xs text-pretty",
+            yaml::as.yaml(
+              as.list(metadata),
+              handlers = list(
+                POSIXct = as.character,
+                Date = as.character
+              )
+            )
+          )
+        ),
+        preview
+      )
     })
   })
 }
@@ -187,19 +217,29 @@ listDocumentsServer <- function(id, documents) {
         ))
       }
 
-      updateSelectedDocument(head(documents(), 1)$id)
+      updateSelectedDocument(head(documents(), 1)$chunk_id)
       summaries <- documents() |>
         dplyr::mutate(.rn = dplyr::row_number()) |>
         dplyr::group_split(.rn) |>
         lapply(
-          function(d)
+          function(d) {
             documentSummaryUI(
-              ns(glue::glue("document-{d$id}")),
+              ns(glue::glue("document-{d$chunk_id}")),
               d,
               active = d$.rn == 1
             )
+          }
         )
-      shiny::tagList(!!!summaries)
+
+      shiny::tagList(
+        if (attr(documents(), "no_filter") %||% FALSE) {
+          shiny::tags$div(
+            class = "text-sm text-center",
+            "No search query, showing first few documents"
+          )
+        },
+        !!!summaries
+      )
     })
 
     shiny::reactive(input$selected_document)
@@ -207,7 +247,7 @@ listDocumentsServer <- function(id, documents) {
 }
 
 
-#' @param document Is supposed to be a single row returned by ragnar_retrive_vss
+#' @param document Is supposed to be a single row returned by ragnar_retrieve_vss
 #'   or ragnar_retrieve_bm25.
 #' @noRd
 documentSummaryUI <- function(id, document, active = FALSE) {
@@ -230,7 +270,7 @@ documentSummaryUI <- function(id, document, active = FALSE) {
 
   shiny::div(
     id = ns("summary"),
-    "data-document-id" = document$id,
+    "data-document-id" = document$chunk_id,
     class = "document-summary flex flex-col bg-gray-100 hover:bg-gray-200 rounded-md w-full text-xs justify-evenly py-2",
     class = if (active) "border border-sky-500" else NULL, # two class fields are concatenated.
     div(
@@ -251,24 +291,26 @@ documentSummaryUI <- function(id, document, active = FALSE) {
       ),
       div(
         class = "rounded-full flex-none justify-self-end font-light",
-        glue::glue("id: #{document$id}")
+        glue::glue("id: #{document$chunk_id}")
       )
     ),
-    div(
-      class = "flex flex-row items-center gap-1 py-1 px-2 font-mono text-gray-500",
-      icon(
-        "gauge",
-        class = "font-light flex-none"
-      ),
+    if (!is.null(document[["metric_name"]])) {
       div(
-        class = "flex-none font-bold",
-        glue::glue("{document$metric_name}:")
-      ),
-      div(
-        class = "flex-none font-light",
-        round(document$metric_value, 3)
+        class = "flex flex-row items-center gap-1 py-1 px-2 font-mono text-gray-500",
+        icon(
+          "gauge",
+          class = "font-light flex-none"
+        ),
+        div(
+          class = "flex-none font-bold",
+          glue::glue("{document$metric_name}:")
+        ),
+        div(
+          class = "flex-none font-light",
+          round(document$metric_value, 3)
+        )
       )
-    ),
+    },
     div(
       class = "flex flex-rows items-center gap-1 py-1 px-2 font-mono text-gray 500",
       div(
@@ -289,20 +331,57 @@ documentSummaryUI <- function(id, document, active = FALSE) {
       ),
       div(
         class = "flex-none font-light",
-        glue::glue("~{as.integer(prettyNum(n_char/4, big.mark = ','))}")
+        glue::glue("~{prettyNum(as.integer(n_char/4), big.mark = ',')}")
       )
     )
   )
 }
 
 
-switchInput <- function(id, trueLabel, falseLabel) {
+switchInput <- function(id, switch_values) {
   ns <- \(i) shiny::NS(id, i)
+  stopifnot(length(switch_values) <= 2, is.character(switch_values))
+
+  container <- function(...) {
+    shiny::div(
+      class = "flex flex-row bg-gray-200 rounded-full p-1 gap-1 text-xs",
+      shiny::tags$script(shiny::HTML(glue::glue(
+        "(function() {{
+        function init() {{
+          console.log('setting input value');
+          Shiny.setInputValue('{ns('value')}', '{switch_values[1]}');
+        }}
+
+        function waitForShiny() {{
+          if (window.Shiny && Shiny.setInputValue) {{
+            init();
+          }} else {{
+            setTimeout(waitForShiny, 50);
+          }}
+        }}
+
+        waitForShiny();
+      }})()"
+      ))),
+      ...
+    )
+  }
+
+  if (length(switch_values) == 1) {
+    return(container(
+      shiny::tags$button(
+        class = ns('btn'),
+        class = "rounded-full p-1 px-4 bg-white disabled",
+        disabled = TRUE,
+        switch_values
+      )
+    ))
+  }
 
   jsHandler <- function(val) {
     glue::glue(
       "(function() {{
-        Shiny.setInputValue('{ns('value')}', {val});
+        Shiny.setInputValue('{ns('value')}', '{val}');
         var $element = $('.{ns('btn')}');
         $element.
           toggleClass('bg-white disabled').
@@ -311,26 +390,25 @@ switchInput <- function(id, trueLabel, falseLabel) {
     )
   }
 
-  shiny::div(
-    class = "flex flex-row bg-gray-200 rounded-full p-1 gap-1 text-xs",
+  container(
     shiny::tags$button(
       class = ns('btn'),
       class = "rounded-full p-1 px-4 bg-white disabled",
-      onClick = jsHandler('true'),
+      onClick = jsHandler(switch_values[1]),
       disabled = NA,
-      trueLabel
+      switch_values[1]
     ),
     shiny::tags$button(
       class = ns('btn'),
       class = "rounded-full p-1 px-4",
-      onClick = jsHandler('false'),
-      falseLabel
+      onClick = jsHandler(switch_values[2]),
+      switch_values[2]
     )
   )
 }
 
 switchServer <- function(id) {
   shiny::moduleServer(id, function(input, output, session) {
-    shiny::reactive(input$value %||% TRUE)
+    shiny::reactive(input$value)
   })
 }

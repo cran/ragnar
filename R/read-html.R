@@ -22,7 +22,9 @@ html_text3 <- function(
   split_tags = c("h1", "h2", "h3", "p"),
   doc = read_html(file)
 ) {
-  if ("p" %in% split_tags) split_tags <- unique(c("p", split_tags))
+  if ("p" %in% split_tags) {
+    split_tags <- unique(c("p", split_tags))
+  }
 
   if (
     any(stri_detect_fixed(
@@ -113,14 +115,16 @@ vec_frame_flattened_tree <- function(
   check_character(nodes)
   check_string(leaves)
   check_string(names)
-  if (anyDuplicated(c(nodes, leaves, names)))
+  if (anyDuplicated(c(nodes, leaves, names))) {
     stop("target names must be unique")
+  }
 
   frame <- vec_frame_flattened_tree_impl(vec, nodes, leaves, names)
 
   # reorder, drop names, normalize row.names
-  for (missing_node in setdiff(c(nodes, leaves, names), names(frame)))
+  for (missing_node in setdiff(c(nodes, leaves, names), names(frame))) {
     frame[[missing_node]] <- NA_character_
+  }
   frame <- as.list(frame)[c(nodes, names, leaves)]
   frame <- lapply(frame, `names<-`, NULL)
   vctrs::new_data_frame(frame)
@@ -193,6 +197,7 @@ vec_frame_flattened_tree_impl <-
 #' If both `frame_by_tags` and `split_by_tags` are `NULL`, then a string
 #' (length-1 character vector) is returned.
 #' @export
+#' @keywords internal
 #'
 #' @examples
 #' file <- tempfile(fileext = ".html")
@@ -295,7 +300,9 @@ ragnar_read_document <- function(
     return(text)
   }
 
-  if (!inherits(x, "xml_node")) x <- read_html(x)
+  if (!inherits(x, "xml_node")) {
+    x <- read_html(x)
+  }
 
   text <- html_text3(
     doc = x,
@@ -314,7 +321,9 @@ ragnar_read_document <- function(
     leaves = "text"
   )
 
-  if (base::setequal(split_by_tags, frame_by_tags)) frame[["tag"]] <- NULL
+  if (base::setequal(split_by_tags, frame_by_tags)) {
+    frame[["tag"]] <- NULL
+  }
 
   as_tibble(frame)
 }
@@ -334,8 +343,7 @@ ragnar_read_document <- function(
 #'   page. Note that regardless of this setting, only child links are followed
 #'   when `depth > 0`.
 #'
-#' @param progress Logical, draw a progress bar if `depth > 0`. A separate
-#'   progress bar is drawn per recursion level.
+#' @param progress Logical, draw a progress bar if `depth > 0`.
 #'
 #' @param ... Currently unused. Must be empty.
 #'
@@ -393,14 +401,21 @@ ragnar_find_links <- function(
 
   deque <- reticulate::import("collections")$deque()
   visited <- reticulate::import_builtins()$set()
+  resolved <- reticulate::dict()
+  collected <- reticulate::import_builtins()$set()
   problems <- list()
 
   deque$append(list(url = xml_url2(x), depth = 0))
+  if (!depth) {
+    progress <- FALSE
+  }
 
-  pb <- cli::cli_progress_bar(
-    format = "{cli::pb_spin} Finding links: {length(visited)} | On queue: {length(deque)} | Current depth: {item$depth} | [{round(cli::pb_elapsed_raw)}s]",
-    total = NA
-  )
+  if (progress) {
+    pb <- cli::cli_progress_bar(
+      format = "{cli::pb_spin} Finding links: {length(visited)} | On queue: {length(deque)} | Current depth: {item$depth} | [{round(cli::pb_elapsed_raw)}s]",
+      total = NA
+    )
+  }
 
   # This is wrapped into a try catch so users interrupts are captured and
   # we are able to return the current set of visited pages.
@@ -408,12 +423,19 @@ ragnar_find_links <- function(
     {
       while (length(deque) > 0) {
         item <- deque$popleft()
-        cli::cli_progress_update()
+        if (progress) {
+          cli::cli_progress_update()
+        }
 
         visited$add(item$url)
-
         links <- tryCatch(
-          html_find_links(item$url),
+          {
+            page <- read_html2(item$url)
+            resolved_url <- xml_url2(page) # maybe redirected
+            resolved[item$url] <- resolved_url
+            html_find_links(page)
+          },
+
           error = function(e) {
             # if there's an issue finding child links we log it into the `problems` table
             # which is included in the output as an attribute.
@@ -421,6 +443,7 @@ ragnar_find_links <- function(
               link = item$url,
               problem = conditionMessage(e)
             )
+            resolved[item$url] <- ""
             character(0)
           }
         )
@@ -437,16 +460,22 @@ ragnar_find_links <- function(
           }
         }
 
-        visited$update(as.list(links))
+        collected$update(as.list(links))
       }
     },
     interrupt = function(e) {
       cli::cli_inform(c(i = "User interrupted. Returning the current set!"))
     }
   )
-  cli::cli_progress_update(force = TRUE)
+  if (progress) {
+    cli::cli_progress_update(force = TRUE)
+  }
 
-  out <- sort(reticulate::import_builtins()$list(visited))
+  out <- visited$union(collected)
+  get_resolved <- reticulate::py_to_r(resolved$get)
+  out <- reticulate::iterate(out, \(x) get_resolved(x) %||% x)
+  out <- out[nzchar(out)]
+  out <- unique(sort(url_filter_fn(out)))
 
   if (length(problems)) {
     cli::cli_warn(
@@ -477,7 +506,9 @@ html_find_links <- function(x, absolute = TRUE) {
   links <- stri_replace_last_regex(links, "/$", "") # strip trailing /
   links <- sort(unique(links))
 
-  if (absolute) links <- url_absolute2(links, xml_url2(x))
+  if (absolute) {
+    links <- url_absolute2(links, xml_url2(x))
+  }
 
   links
 }

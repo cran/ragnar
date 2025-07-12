@@ -8,7 +8,9 @@ ragnar_register_tool_retrieve(
   chat,
   store,
   store_description = "the knowledge store",
-  ...
+  ...,
+  name = NULL,
+  title = NULL
 )
 }
 \arguments{
@@ -19,6 +21,12 @@ ragnar_register_tool_retrieve(
 \item{store_description}{Optional string, used for composing the tool description.}
 
 \item{...}{arguments passed on to \code{ragnar_retrieve()}.}
+
+\item{name, title}{Optional tool function name and title. By default,
+\code{store@name} and \code{store@title} will be used if present. The tool \code{name}
+must be a valid R function name and should be unique with the tools
+registered with the \link[ellmer:Chat]{ellmer::Chat} object. \code{title} is used for
+user-friendly display.}
 }
 \value{
 \code{chat}, invisibly.
@@ -28,7 +36,6 @@ Register a 'retrieve' tool with ellmer
 }
 \examples{
 \dontshow{if ((file.exists("r4ds.ragnar.duckdb") && Sys.getenv("OPENAI_API_KEY") != "")) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
-
 system_prompt <- stringr::str_squish("
   You are an expert assistant in R programming.
   When responding, you first quote relevant material from books or documentation,
@@ -36,7 +43,7 @@ system_prompt <- stringr::str_squish("
 ")
 chat <- ellmer::chat_openai(system_prompt, model = "gpt-4o")
 
-store <- ragnar_store_connect("r4ds.ragnar.duckdb", read_only = TRUE)
+store <- ragnar_store_connect("r4ds.ragnar.duckdb")
 ragnar_register_tool_retrieve(chat, store)
 chat$chat("How can I subset a dataframe?")
 \dontshow{\}) # examplesIf}

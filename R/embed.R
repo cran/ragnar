@@ -1,4 +1,4 @@
-#' Embedd Text
+#' Embed Text
 #'
 #' @param x x can be:
 #'  - A character vector, in which case a matrix of embeddings is returned.
@@ -35,7 +35,7 @@ NULL
 embed_ollama <- function(
   x,
   base_url = "http://localhost:11434",
-  model = "all-minilm",
+  model = "snowflake-arctic-embed2:568m",
   batch_size = 10L
 ) {
   if (missing(x) || is.null(x)) {
@@ -66,8 +66,12 @@ embed_ollama <- function(
 
   embeddings <- map2(starts, ends, function(start, end) {
     req <- request(base_url) |>
+      req_user_agent(ragnar_user_agent()) |>
       req_url_path_append("/api/embed") |>
-      req_body_json(list(model = model, input = x[start:end]))
+      req_body_json(list(model = model, input = x[start:end])) |>
+      req_error(body = \(resp) {
+        resp_body_json(resp)$error
+      })
 
     resp <- req_perform(req)
     resp_body_json(resp, simplifyVector = TRUE)$embeddings
@@ -90,7 +94,7 @@ embed_openai <- function(
   base_url = "https://api.openai.com/v1",
   api_key = get_envvar("OPENAI_API_KEY"),
   dims = NULL,
-  user = get_ragnar_username(),
+  user = get_user(),
   batch_size = 20L
 ) {
   if (missing(x) || is.null(x)) {
@@ -138,6 +142,7 @@ embed_openai <- function(
     data$input <- as.list(text[start:end])
 
     req <- request(base_url) |>
+      req_user_agent(ragnar_user_agent()) |>
       req_url_path_append("/embeddings") |>
       req_auth_bearer_token(api_key) |>
       req_retry(max_tries = 2L) |>
@@ -184,10 +189,25 @@ get_envvar <- function(name, error_call = caller_env()) {
   val
 }
 
-get_ragnar_username <- function() {
-  sprintf("'%s' via ragnar", Sys.info()[["user"]])
+get_user <- function() {
+  sys_info <- Sys.info()
+  user <- sys_info[["effective_user"]]
+  if (user != "unknown") {
+    return(user)
+  }
+  user <- sys_info[["user"]]
+  if (user != "unknown") {
+    return(user)
+  }
+  NULL
+}
+
+ragnar_user_agent <- function() {
+  paste0("r-ragnar/", .package_version)
 }
 
 is_testing <- function() {
   identical(Sys.getenv("TESTTHAT"), "true")
 }
+
+.package_version <- c(read.dcf('DESCRIPTION', 'Version'))

@@ -2,73 +2,135 @@
 % Please edit documentation in R/store.R
 \name{ragnar_store_create}
 \alias{ragnar_store_create}
+\alias{ragnar_store_connect}
 \title{Create and connect to a vector store}
 \usage{
 ragnar_store_create(
   location = ":memory:",
   embed = embed_ollama(),
+  ...,
   embedding_size = ncol(embed("foo")),
   overwrite = FALSE,
-  ...,
   extra_cols = NULL,
-  name = NULL
+  name = NULL,
+  title = NULL,
+  version = 2
 )
+
+ragnar_store_connect(location, ..., read_only = TRUE)
 }
 \arguments{
-\item{location}{filepath, or \verb{:memory:}}
+\item{location}{filepath, or \verb{:memory:}. Location can also be a database name
+specified with \code{md:dbname}, in this case the database will be created in
+MotherDuck after a connection is established.}
 
 \item{embed}{A function that is called with a character vector and returns a
 matrix of embeddings. Note this function will be serialized and then
 deserialized in new R sessions, so it cannot reference to any objects in
 the global or parent environments. Make sure to namespace all function
 calls with \code{::}. If additional R objects must be available in the function,
-you can optionally supply a \code{carrier::crate()} with packaged data.
-It can also be \code{NULL} for stores that don't need to embed their texts, for example,
-if only using FTS algorithms such as \code{\link[=ragnar_retrieve_bm25]{ragnar_retrieve_bm25()}}.}
+you can optionally supply a \code{carrier::crate()} with packaged data. It can
+also be \code{NULL} for stores that don't need to embed their texts, for
+example, if only using FTS algorithms such as \code{\link[=ragnar_retrieve_bm25]{ragnar_retrieve_bm25()}}.}
+
+\item{...}{unused; must be empty.}
 
 \item{embedding_size}{integer}
 
 \item{overwrite}{logical, what to do if \code{location} already exists}
 
-\item{...}{Unused. Must be empty.}
-
-\item{extra_cols}{A zero row data frame used to specify additional columns that
-should be added to the store. Such columns can be used for adding additional
-context when retrieving. See the examples for more information.
+\item{extra_cols}{A zero row data frame used to specify additional columns
+that should be added to the store. Such columns can be used for adding
+additional context when retrieving. See the examples for more information.
 \code{\link[vctrs:vec_cast]{vctrs::vec_cast()}} is used to consistently perform type checks and casts
 when inserting with \code{\link[=ragnar_store_insert]{ragnar_store_insert()}}.}
 
 \item{name}{A unique name for the store. Must match the \verb{^[a-zA-Z0-9_-]+$}
 regex. Used by \code{\link[=ragnar_register_tool_retrieve]{ragnar_register_tool_retrieve()}} for registering tools.}
+
+\item{title}{A title for the store, used by \code{\link[=ragnar_register_tool_retrieve]{ragnar_register_tool_retrieve()}}
+when the store is registered with an \link[ellmer:Chat]{ellmer::Chat} object.}
+
+\item{version}{integer. The version of the store to create. See details.}
+
+\item{read_only}{logical, whether the returned connection can be used to
+modify the store.}
 }
 \value{
-a \code{DuckDBRagnarStore} object
+a \code{RagnarStore} object
 }
 \description{
 Create and connect to a vector store
+}
+\details{
+\subsection{Store versions}{
+
+\strong{Version 2 – documents with chunk ranges} (default)
+
+With \code{version = 2}, ragnar stores each document once and records the start
+and end positions of its chunks. This provides strong support for overlapping
+chunk ranges with de-overlapping at retrieval, and generally allows
+retrieving arbitrary ranges from source documents, but does not support
+modifying chunks directly before insertion. Chunks can be augmented via the
+\code{context} field and with additional fields passed to \code{extra_cols}. The
+easiest way to prepare \code{chunks} for \code{version = 2} is with
+\code{read_as_markdown()} and \code{markdown_chunk()}.
+
+\strong{Version 1 – flat chunks}
+
+With \code{version = 1}, ragnar keeps all chunks in a single table. This lets you
+easily modify chunk text before insertion. However, dynamic rechunking
+(de-overlapping) or extracting arbitrary ranges from source documents is not
+supported, since the original full documents are no longer available. Chunks
+can be augmented by modifying the chunk text directly (e.g., with \code{glue()}).
+Additionally, if you intend to call \code{ragnar_store_update()}, it is your
+responsibility to provide \code{rlang::hash(original_full_document)} with each
+chunk. The easiest way to prepare \code{chunks} for \code{version = 1} is with
+\code{ragnar_read()} and \code{ragnar_chunk()}.
+}
 }
 \examples{
 # A store with a dummy embedding
 store <- ragnar_store_create(
   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
+  version = 1
 )
 ragnar_store_insert(store, data.frame(text = "hello"))
 
 # A store with a schema. When inserting into this store, users need to
-# provide a `area` column.
+# provide an `area` column.
 store <- ragnar_store_create(
   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
   extra_cols = data.frame(area = character()),
+  version = 1
 )
 ragnar_store_insert(store, data.frame(text = "hello", area = "rag"))
 
 # If you already have a data.frame with chunks that will be inserted into
-# the store, you can quickly create a suitable store with:
+# the store, you can quickly create a suitable store with `vec_ptype()`:
 chunks <- data.frame(text = letters, area = "rag")
 store <- ragnar_store_create(
   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
   extra_cols = vctrs::vec_ptype(chunks),
+  version = 1
 )
 ragnar_store_insert(store, chunks)
 
+# version = 2 (the default) has support for deoverlapping
+store <- ragnar_store_create(
+  # if embed = NULL, then only bm25 search is used (not vss)
+  embed = NULL
+)
+doc <- MarkdownDocument(
+  paste0(letters, collapse = ""),
+  origin = "/some/where"
+)
+chunks <- markdown_chunk(doc, target_size = 3, target_overlap = 2 / 3)
+chunks$context <- substring(chunks$text, 1, 1)
+chunks
+ragnar_store_insert(store, chunks)
+ragnar_store_build_index(store)
+
+ragnar_retrieve(store, "abc bcd xyz", deoverlap = FALSE)
+ragnar_retrieve(store, "abc bcd xyz", deoverlap = TRUE)
 }

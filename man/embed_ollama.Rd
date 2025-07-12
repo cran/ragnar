@@ -3,12 +3,12 @@
 \name{embed_ollama}
 \alias{embed_ollama}
 \alias{embed_openai}
-\title{Embedd Text}
+\title{Embed Text}
 \usage{
 embed_ollama(
   x,
   base_url = "http://localhost:11434",
-  model = "all-minilm",
+  model = "snowflake-arctic-embed2:568m",
   batch_size = 10L
 )
 
@@ -18,7 +18,7 @@ embed_openai(
   base_url = "https://api.openai.com/v1",
   api_key = get_envvar("OPENAI_API_KEY"),
   dims = NULL,
-  user = get_ragnar_username(),
+  user = get_user(),
   batch_size = 20L
 )
 }
@@ -55,7 +55,7 @@ matrix described in the previous sentence.
 A matrix of embeddings with 1 row per input string, or a dataframe with an 'embedding' column.
 }
 \description{
-Embedd Text
+Embed Text
 }
 \examples{
 text <- c("a chunk of text", "another chunk of text", "one more chunk of text")

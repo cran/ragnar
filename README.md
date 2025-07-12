@@ -12,10 +12,10 @@
 `ragnar` is an R package that helps implement Retrieval-Augmented
 Generation (RAG) workflows. It focuses on providing a complete solution
 with sensible defaults, while still giving the knowledgeable user
-precise control over each steps. We don’t believe that you can fully
+precise control over each step. We don’t believe that you can fully
 automate the creation of a good RAG system, so it’s important that
 `ragnar` is not a black box. `ragnar` is designed to be transparent. You
-can inspect easily outputs at intermediate steps to understand what’s
+can easily inspect outputs at intermediate steps to understand what’s
 happening.
 
 ## Installation
@@ -24,6 +24,13 @@ You can install ragnar from CRAN with:
 
 ``` r
 install.packages("ragnar")
+```
+
+You can install the development version from GitHub with:
+
+``` r
+# install.packages("pak")
+pak::pak("tidyverse/ragnar")
 ```
 
 ## Key Steps
@@ -36,56 +43,46 @@ to Markdown.
 
 Key functions:
 
-- `ragnar_read()`: Convert a file or URL to a dataframe
-- `read_as_markdown`: Convert a file or URL to markdown
+- `read_as_markdown()`: Convert a file or URL to markdown
 - `ragnar_find_links()`: Find all links in a webpage
 
 ### 2. Text Chunking
 
 Next we divide each document into chunks. Ragnar defaults to a strategy
-that preserves some of the semantics of the document, but provide plenty
-of opportunities to tweak the approach.
+that preserves some of the semantics of the document, but provides
+plenty of opportunities to tweak the approach.
 
 Key functions:
 
-- `ragnar_chunk()`: Higher-level function that both identifies semantic
-  boundaries and chunks text.
-- `ragnar_segment()`: Lower-level function that identifies semantic
-  boundaries.
-- `ragnar_chunk_segments()`: Lower-level function that chunks
-  pre-segmented text.
+- `markdown_chunk()`: Full-featured chunker that identifies semantic
+  boundaries and intelligently chunks text.
 
 ### 3. Context Augmentation (Optional)
 
 RAG applications benefit from augmenting text chunks with additional
 context, such as document headings and subheadings. `ragnar` makes it
-easy to keep track of headings and subheadings as part of chunking,
-which can then be used to support template-based augmentation. (See
-examples below)
+easy to keep track of headings and subheadings as part of chunking.
 
-Key functions:
-
-- `ragnar_read()`: Use `frame_by_tags` and/or `split_by_tags` arguments
-  to associate text chunks with their document position.
-- `markdown_segment()`: Segment markdown text into a character vector
-  using semantic tags (e.g., headings, paragraphs, or code chunks).
-- `markdown_frame()`: Convert markdown text into a dataframe.
+`markdown_chunk()` automatically associates each chunk with the headings
+that are in scope for that chunk.
 
 ### 4. Embedding
 
 `ragnar` can help compute embeddings for each chunk. The goal is for
 `ragnar` to provide access to embeddings from popular LLM providers.
-Currently `ollama` and `openai` providers are supported.
 
 Key functions:
 
 - `embed_ollama()`
 - `embed_openai()`
+- `embed_bedrock()`
+- `embed_databricks()`
+- `embed_google_vertex()`
 
 Note that calling the embedding function directly is typically not
 necessary. Instead, the embedding function is specified when a store is
 first created, and then automatically called when needed by
-`ragnar_retreive()` and `ragnar_store_insert()`.
+`ragnar_retrieve()` and `ragnar_store_insert()`.
 
 ### 5. Storage
 
@@ -107,16 +104,18 @@ bm25 text search.
 
 Key functions:
 
-- `ragnar_retrieve()`
+- `ragnar_retrieve()`: high-level function that performs both `vss` and
+  `bm25` search and de-overlaps retrieved results.
 - `ragnar_retrieve_vss()`: Retrieve using [`vss` DuckDB
   extension](https://duckdb.org/docs/stable/core_extensions/vss)
 - `ragnar_retrieve_bm25()`: Retrieve using
   [`full-text search DuckDB extension`](https://duckdb.org/docs/stable/core_extensions/full_text_search)
+- `chunks_deoverlap()`: Consolidates retrieved chunks that overlap.
 
 ### 7. Chat Augmentation
 
 `ragnar` can equip an `ellmer::Chat` object with a retrieve tool that
-enables an LLM to retreive content from a store on-demand.
+enables an LLM to retrieve content from a store on-demand.
 
 - `ragnar_register_tool_retrieve(chat, store)`.
 
@@ -130,7 +129,6 @@ library(ragnar)
 
 base_url <- "https://r4ds.hadley.nz"
 pages <- ragnar_find_links(base_url)
-#> ⠙ Finding links: 38 | On queue: 0 | Current depth: 0 | [0s]
 
 store_location <- "r4ds.ragnar.duckdb"
 
@@ -139,27 +137,9 @@ store <- ragnar_store_create(
   embed = \(x) ragnar::embed_openai(x, model = "text-embedding-3-small")
 )
 
-
 for (page in pages) {
   message("ingesting: ", page)
-  chunks <- page |>
-    ragnar_read(frame_by_tags = c("h1", "h2", "h3")) |>
-    ragnar_chunk(boundaries = c("paragraph", "sentence")) |>
-    # add context to chunks
-    dplyr::mutate(
-      text = glue::glue(
-        r"---(
-        # Excerpt from the book "R for Data Science (2e)"
-        link: {origin}
-        chapter: {h1}
-        section: {h2}
-        subsection: {h3}
-        content: {text}
-
-        )---"
-      )
-    )
-
+  chunks <- page |> read_as_markdown() |> markdown_chunk()
   ragnar_store_insert(store, chunks)
 }
 #> ingesting: https://r4ds.hadley.nz/
@@ -201,7 +181,6 @@ for (page in pages) {
 #> ingesting: https://r4ds.hadley.nz/workflow-scripts.html
 #> ingesting: https://r4ds.hadley.nz/workflow-style.html
 
-
 ragnar_store_build_index(store)
 ```
 
@@ -221,164 +200,81 @@ text <- "How can I subset a dataframe with a logical vector?"
 #' # Retrieving Chunks
 #' Once the store is set up, retrieve the most relevant text chunks like this
 
-embedding_near_chunks <- ragnar_retrieve_vss(store, text, top_k = 3)
-embedding_near_chunks
-#> # A tibble: 3 × 6
-#>      id metric_name     metric_value origin                          hash  text 
-#>   <int> <chr>                  <dbl> <chr>                           <chr> <chr>
-#> 1   630 cosine_distance        0.394 https://r4ds.hadley.nz/logical… 943f… "# E…
-#> 2   653 cosine_distance        0.399 https://r4ds.hadley.nz/logical… 943f… "# E…
-#> 3   632 cosine_distance        0.401 https://r4ds.hadley.nz/logical… 943f… "# E…
-embedding_near_chunks$text[1] |> cat(sep = "\n~~~~~~~~\n")
-#> # Excerpt from the book "R for Data Science (2e)"
-#> link: https://r4ds.hadley.nz/logicals.html
-#> chapter: # 12  Logical vectors
-#> section: ## 12.1 Introduction
-#> subsection: NA
-#> content: In this chapter, you’ll learn tools for working with logical vectors. Logical vectors are the simplest type of vector because each element can only be one of three possible values: `TRUE`, `FALSE`, and `NA`. It’s relatively rare to find logical vectors in your raw data, but you’ll create and manipulate them in the course of almost every analysis.
-#> 
-#> We’ll begin by discussing the most common way of creating logical vectors: with numeric comparisons. Then you’ll learn about how you can use Boolean algebra to combine different logical vectors, as well as some useful summaries. We’ll finish off with `[if_else()](https://dplyr.tidyverse.org/reference/if_else.html)` and `[case_when()](https://dplyr.tidyverse.org/reference/case_when.html)`, two useful functions for making conditional changes powered by logical vectors.
-
-bm25_near_chunks <- ragnar_retrieve_bm25(store, text, top_k = 3)
-bm25_near_chunks
-#> # A tibble: 3 × 6
-#>      id metric_name metric_value origin                              hash  text 
-#>   <int> <chr>              <dbl> <chr>                               <chr> <chr>
-#> 1   988 bm25               0.661 https://r4ds.hadley.nz/webscraping… 8629… "# E…
-#> 2   842 bm25               0.665 https://r4ds.hadley.nz/regexps.html 15ee… "# E…
-#> 3   337 bm25               0.667 https://r4ds.hadley.nz/datetimes.h… fd3e… "# E…
-bm25_near_chunks$text[1] |> cat(sep = "\n~~~~~~~~\n")
+(relevant_chunks <- ragnar_retrieve(store, text))
 ```
 
-    #> # Excerpt from the book "R for Data Science (2e)"
-    #> link: https://r4ds.hadley.nz/webscraping.html
-    #> chapter: # 24  Web scraping
-    #> section: ## 24.4 Extracting data
-    #> subsection: ### 24.4.2 Nesting selections
-    #> content: In most cases, you’ll use `[html_elements()](https://rvest.tidyverse.org/reference/html_element.html)` and `[html_element()](https://rvest.tidyverse.org/reference/html_element.html)` together, typically using `[html_elements()](https://rvest.tidyverse.org/reference/html_element.html)` to identify elements that will become observations then using `[html_element()](https://rvest.tidyverse.org/reference/html_element.html)` to find elements that will become variables. Let’s see this in action using a simple example. Here we have an unordered list (`<ul>)` where each list item (`<li>`) contains some information about four characters from StarWars:
-    #> 
-    #> ```
-    #> html <- minimal_html("
-    #>   <ul>
-    #>     <li><b>C-3PO</b> is a <i>droid</i> that weighs <span class='weight'>167 kg</span></li>
-    #>     <li><b>R4-P17</b> is a <i>droid</i></li>
-    #>     <li><b>R2-D2</b> is a <i>droid</i> that weighs <span class='weight'>96 kg</span></li>
-    #>     <li><b>Yoda</b> weighs <span class='weight'>66 kg</span></li>
-    #>   </ul>
-    #>   ")
-    #> ```
-    #> 
-    #> We can use `[html_elements()](https://rvest.tidyverse.org/reference/html_element.html)` to make a vector where each element corresponds to a different character:
-    #> 
-    #> ```
-    #> characters <- html |> html_elements("li")
-    #> characters
-    #> #> {xml_nodeset (4)}
-    #> #> [1] <li>\n<b>C-3PO</b> is a <i>droid</i> that weighs <span class="weight"> ...
-    #> #> [2] <li>\n<b>R4-P17</b> is a <i>droid</i>\n</li>
-    #> #> [3] <li>\n<b>R2-D2</b> is a <i>droid</i> that weighs <span class="weight"> ...
-    #> #> [4] <li>\n<b>Yoda</b> weighs <span class="weight">66 kg</span>\n</li>
-    #> ```
+    #> # A tibble: 4 × 9
+    #>   origin         doc_id chunk_id start   end cosine_distance bm25  context text 
+    #>   <chr>          <list> <list>   <int> <int> <list>          <lis> <chr>   <chr>
+    #> 1 https://r4ds.… <int>  <int>     2192  4007 <dbl [1]>       <dbl> "# 25 … "```…
+    #> 2 https://r4ds.… <int>  <int>     1622  4205 <dbl [2]>       <dbl> "# 12 … "```…
+    #> 3 https://r4ds.… <int>  <int>    19379 20792 <dbl [1]>       <dbl> "# 12 … "Tha…
+    #> 4 https://r4ds.… <int>  <int>    12795 15259 <dbl [2]>       <dbl> "# 24 … "The…
 
 ``` r
 
-# get both vss and bm26
-relevant_chunks <- ragnar_retrieve(
-  store,
-  text,
-  top_k = 3
-)
-relevant_chunks
-#> # A tibble: 6 × 6
-#>      id origin                                hash  text  cosine_distance   bm25
-#>   <int> <chr>                                 <chr> <chr>           <dbl>  <dbl>
-#> 1   630 https://r4ds.hadley.nz/logicals.html  943f… "# E…           0.394 NA    
-#> 2   653 https://r4ds.hadley.nz/logicals.html  943f… "# E…           0.399 NA    
-#> 3   632 https://r4ds.hadley.nz/logicals.html  943f… "# E…           0.401 NA    
-#> 4   988 https://r4ds.hadley.nz/webscraping.h… 8629… "# E…          NA      0.661
-#> 5   842 https://r4ds.hadley.nz/regexps.html   15ee… "# E…          NA      0.665
-#> 6   337 https://r4ds.hadley.nz/datetimes.html fd3e… "# E…          NA      0.667
 
 #'  Register ellmer tool
 #' You can register an ellmer tool to let the LLM retrieve chunks.
 system_prompt <- stringr::str_squish(
-  r"--(
+  "
   You are an expert R programmer and mentor. You are concise.
-  You always respond by first direct quoting material from book or documentation,
-  then adding your own additional context and interpertation.
-  Always include links to the source materials used.
-  )--"
+
+  Before responding, retrieve relevant material from the knowledge store. Quote or
+  paraphrase passages, clearly marking your own words versus the source. Provide a
+  working link for every source cited, as well as any additional relevant links.
+  Do not answer unless you have retrieved and cited a source.
+  "
 )
 chat <- ellmer::chat_openai(
   system_prompt,
-  model = "gpt-4.1",
-  params = ellmer::params(temperature = .5)
+  model = "gpt-4.1"
 )
 
 ragnar_register_tool_retrieve(chat, store, top_k = 10)
 
 chat$chat("How can I subset a dataframe?")
-#> ◯ [tool call] rag_retrieve_from_store_001(text = "subset a dataframe")
-#> ● #> # Excerpt from the book "R for Data Science (2e)"
-#>   #> link: https://r4ds.hadley.nz/functions.html
-#>   #> chapter: # 25  Functions
-#>   #> section: ## 25.3 Data frame functions
-#>   #> subsection: ### 25.3.3 Common use cases
-#>   #> …
+#> ◯ [tool call] rag_retrieve_from_store_001(text = "How to subset a dataframe in
+#> R")
+#> ● #> [{"origin":"https://r4ds.hadley.nz/arrow.html","doc_id":2,"chunk_id":13,"…
 ```
 
-    #> From "R for Data Science (2e)":
+    #> You can subset a dataframe in R in several ways:
     #> 
-    #> > Several dplyr verbs are special cases of `[`:  
-    #> > 
-    #> > * `[filter()](https://dplyr.tidyverse.org/reference/filter.html)` is 
-    #> equivalent to subsetting the rows with a logical vector, taking care to exclude
-    #> missing values:
-    #> > 
-    #> >   ```
-    #> >   df |> filter(x > 1)
-    #> >   # same as
-    #> >   df[!is.na(df$x) & df$x > 1, ]
-    #> >   ```
-    #> > * Both `[select()](https://dplyr.tidyverse.org/reference/select.html)` and 
-    #> `[relocate()](https://dplyr.tidyverse.org/reference/relocate.html)` are similar
-    #> to subsetting the columns with a character vector:
-    #> > 
-    #> >   ```
-    #> >   df |> select(x, z)
-    #> >   # same as
-    #> >   df[, c("x", "z")]
-    #> >   ```
-    #> > 
-    #> > Base R also provides a function that combines the features of `filter()` and 
-    #> `select()` called [`subset()`](https://rdrr.io/r/base/subset.html):
+    #> 1. Using the [ (bracket) operator:
+    #> - Select rows and/or columns: df[rows, cols]
+    #> - Example:
+    #> ```r
+    #> df[1, 2]          # first row, second column
+    #> df[, c("x","y")]  # all rows, columns x and y
+    #> df[df$x > 1, ]    # rows where x > 1, all columns
+    #> ```
+    #> If df is a tibble, the result of df[, "x"] is always a tibble; for a 
+    #> data.frame, it returns a vector unless you use drop=FALSE: df[, "x", 
+    #> drop=FALSE] 
+    #> ([source](https://r4ds.hadley.nz/base-R.html#subsetting-data-frames)).
     #> 
-    #> > ```
-    #> > df |> filter(x > 1) |> select(y, z)
-    #> > # same as
-    #> > df |> subset(x > 1, c(y, z))
-    #> > ```
+    #> 2. With dplyr for more readable code:
+    #> - Use filter() for subsetting rows and select() for columns:
+    #> ```r
+    #> library(dplyr)
+    #> df %>% filter(x > 1)            # rows where x > 1
+    #> df %>% select(x, y)             # columns x and y
+    #> df %>% filter(x > 1) %>% select(x, y)  # both
+    #> ```
+    #> - Many dplyr verbs are wrappers for subsetting, e.g., filter(), arrange(), and 
+    #> select() ([source](https://r4ds.hadley.nz/base-R.html#dplyr-equivalents)).
     #> 
-    #> ([source](https://r4ds.hadley.nz/base-R.html#selecting-multiple-elements-with))
+    #> 3. subset() function (base R):
+    #> ```r
+    #> subset(df, x > 1, select = c(x, y))
+    #> ```
+    #> This combines row/column subsetting in one call.
     #> 
-    #> Additional context:
+    #> Summary: Use df[rows, cols], dplyr's filter() and select(), or subset() for 
+    #> subsetting dataframes.
+    #> - Reference: https://r4ds.hadley.nz/base-R.html#subsetting-data-frames
+    #> - Reference: https://dplyr.tidyverse.org/reference/filter.html
+    #> - Reference: https://rdrr.io/r/base/subset.html
     #> 
-    #> - **Base R**:  
-    #>   - Subset rows: `df[rows, ]` (where `rows` is a logical or integer vector)
-    #>   - Subset columns: `df[, cols]` (where `cols` is a name, number, or character 
-    #> vector)
-    #>   - Both: `df[rows, cols]`
-    #>   - Use `drop = FALSE` to always return a data frame: `df[, "x", drop = FALSE]`
-    #> 
-    #> - **dplyr** (tidyverse):  
-    #>   - Subset rows: `df |> filter(condition)`
-    #>   - Subset columns: `df |> select(col1, col2)`
-    #>   - Both: `df |> filter(condition) |> select(col1, col2)`
-    #> 
-    #> - **subset()**:  
-    #>   - `subset(df, condition, select = c(cols))`
-    #> 
-    #> Choose the style that matches your workflow (base R or tidyverse).  
-    #> - For more: [dplyr filter](https://dplyr.tidyverse.org/reference/filter.html), 
-    #> [dplyr select](https://dplyr.tidyverse.org/reference/select.html), 
-    #> [base::subset](https://rdrr.io/r/base/subset.html).
+    #> Let me know if you want an example with your own dataset or more details!

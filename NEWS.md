@@ -1,3 +1,35 @@
+# ragnar 0.2.1
+
+* `ragnar_register_tool_retrieve()` now registers a tool that will not return 
+  previously returned chunks, enabling the LLM to perform deeper searches of 
+  a ragnar store with repeated tool calls (#106).
+
+* Updates for ellmer v0.3.0 and duckdb v1.3.1 (#99)
+
+* Improved docs and error message in `ragnar_store_insert()` (@mattwarkentin, #88)
+
+* `ragnar_find_links()` can now parse `sitemap.xml` files. It also gains a
+  `validate` argument, allowing for sending a `HEAD` request to each link and
+  filtering out broken links (#83).
+
+* `ragnar_inspector()` now renders all urls as clickable links in the chunk markdown
+   viewer, even if url is not a formal markdown link (#82).
+
+* Before running examples and tests we now check if ragnar can load DuckDB extensions.
+  This fixes issues in environments where DuckDB pre-built binaries for extensions are not
+  compatible with the installed DuckDB version (#94).
+
+* Added `embed_lm_studio` to use LMStudio as an embedding provider (#100).
+
+* Fixed a bug causing `ragnar_retrieve()` to fail when documents were inserted without
+  an origin (#102).
+
+* We now suppress a "Couldn't find ffmpeg or avconv" warning when importing markitdown when
+  using `read_as_markdown()`. The warning would only be relevant for users doing
+  audio transcription (#103).
+
+* Added `embed_google_gemini` to use Google Gemini API as an embedding provider (#105).
+
 # ragnar 0.2.0
 
 * `ragnar_store_create()` gains a new argument: `version`, with default `2`.
@@ -5,7 +37,7 @@
   To support these features, the internal schema and ingestion requirements are different.
   See `markdown_chunk()` and new S7 classes `MarkdownDocument` and `MarkdownDocumentChunks`.
   Backwards compatibility is maintained with version = 1. (#58, #39, #36)
-  
+
 * `ragnar_store_create()` now supports Date and POSIXct classes supplied to `extra_cols`.
 
 * `ragnar_store_create()` now supports remote MotherDuck Databases specified with `md:<dbname>` as

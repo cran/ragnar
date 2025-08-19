@@ -84,7 +84,7 @@ ragnar_store_create_v1 <- function(
     }
   }
 
-  metadata <- tibble::tibble(
+  metadata <- tibble(
     embedding_size,
     embed_func = blob::blob(serialize(embed, NULL)),
     schema = blob::blob(serialize(schema, NULL)),
@@ -277,6 +277,10 @@ ragnar_store_insert_v1 <- function(store, chunks) {
     is.character(chunks$hash)
   )
 
+  if (anyNA(chunks$text)) {
+    stop("`text` cannot contain NA values.")
+  }
+
   if (!is.null(store@embed) && !"embedding" %in% names(chunks)) {
     chunks$embedding <- store@embed(chunks$text)
     stopifnot(
@@ -304,8 +308,6 @@ ragnar_store_insert_v1 <- function(store, chunks) {
     "chunks",
     chunks
   )
-
-  invisible(store)
 }
 
 

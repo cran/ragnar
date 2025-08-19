@@ -69,11 +69,11 @@ ragnar_retrieve_vss <- function(
   ## It's pretty similar to the sql I'd write by hand, and optimizes to
   ## an essentially identical physical plan.
 
-  .[method_func, order_direction] <- method_to_info(method)
+  info <- method_to_info(method)
   query_vector
   metric_value <- sql(sprintf(
     "%s(embedding, %s)",
-    method_func,
+    info$func,
     sql_float_array_value(query_vector)
   ))
   con <- store@con
@@ -235,7 +235,7 @@ sql_float_array_value <- function(...) {
 method_to_info <- function(method) {
   # see possible distances:
   # https://duckdb.org/docs/stable/sql/functions/array.html#array-native-functions
-  switch(
+  x <- switch(
     method,
 
     ## the vss extension only currently supports three array distance functions
@@ -268,6 +268,8 @@ method_to_info <- function(method) {
 
     stop("Unknown method")
   )
+  names(x) <- c("func", "direction")
+  as.list(x)
 }
 
 
@@ -300,7 +302,7 @@ get_store_embed <- function(x) {
 
 ragnar_retrieve_vss_tbl <- function(tbl, text, top_k, method) {
   rlang::check_installed("dbplyr")
-  .[.., order_direction] <- method_to_info(method)
+  order_direction <- method_to_info(method)$direction
   tbl |>
     mutate(
       metric_value = sql(calculate_vss(tbl, text, method)),
@@ -344,7 +346,7 @@ calculate_vss <- function(store, text, method) {
   embedded_text <- embed(text)
   embedding_size <- ncol(embedded_text)
 
-  .[method_function, ..] <- method_to_info(method)
+  method_function <- method_to_info(method)$func
   glue(
     r"---(
     {method_function}(
@@ -484,7 +486,7 @@ ragnar_retrieve_vss_and_bm25 <- function(store, text, top_k = 3, ...) {
 #'   represents a chunk and always contains a `text` column.
 #'
 #' @family ragnar_retrieve
-#' @examplesIf (rlang::is_installed("dbplyr") && nzchar(Sys.getenv("OPENAI_API_KEY")))
+#' @examplesIf (rlang::is_installed("dbplyr") && nzchar(Sys.getenv("OPENAI_API_KEY")) && ragnar:::can_load_duckdb_extensions())
 #' ## Build a small store with categories
 #' store <- ragnar_store_create(
 #'   embed = \(x) ragnar::embed_openai(x, model = "text-embedding-3-small"),
@@ -553,13 +555,13 @@ chunks_deoverlap <- function(store, chunks) {
   }
   deoverlapped <- chunks |>
     mutate(embedding = NULL) |>
-    arrange(origin, start) |>
+    arrange(origin, doc_id, start) |>
     mutate(
-      .by = origin,
+      .by = c(origin, doc_id),
       overlap_grp = cumsum(start > lag(end, default = -1L))
     ) |>
     summarize(
-      .by = c(origin, overlap_grp),
+      .by = c(origin, doc_id, overlap_grp),
       origin = first(origin),
       start = first(start),
       end = last(end),
@@ -576,7 +578,7 @@ chunks_deoverlap <- function(store, chunks) {
     "_ragnar_tmp_rechunk",
     deoverlapped |>
       mutate(
-        origin,
+        doc_id,
         start,
         end,
         'deoverlapped_id' = row_number(),
@@ -592,7 +594,7 @@ chunks_deoverlap <- function(store, chunks) {
       doc.text[ rechunked.start: rechunked.end ] AS text
     FROM _ragnar_tmp_rechunk rechunked
     JOIN documents doc
-    USING (origin)
+    USING (doc_id)
     ORDER BY rechunked.deoverlapped_id
     "
   )$text

@@ -55,7 +55,7 @@
 #'
 #' @returns a `RagnarStore` object
 #' @export
-#' @examples
+#' @examplesIf ragnar:::can_load_duckdb_extensions()
 #' # A store with a dummy embedding
 #' store <- ragnar_store_create(
 #'   embed = \(x) matrix(stats::runif(10), nrow = length(x), ncol = 10),
@@ -137,6 +137,7 @@ process_embed_func <- function(embed) {
   if (inherits(embed, "crate")) {
     return(embed)
   }
+  og_embed_env <- environment(embed)
   environment(embed) <- baseenv()
   embed <- rlang::zap_srcref(embed)
 
@@ -163,6 +164,13 @@ process_embed_func <- function(embed) {
           # ensure 'model' is explicit arg embedded in call
           if (!"model" %in% names(x)) {
             x["model"] <- formals(fn)["model"]
+          }
+
+          if (!is.character(x[["model"]])) {
+            tryCatch(
+              x[["model"]] <- eval(x[["model"]], og_embed_env),
+              error = function(e) NULL
+            )
           }
 
           # preserve `...` if they were present in the call (call_match() removes them)
@@ -261,12 +269,11 @@ ragnar_store_connect <- function(
   )
 }
 
-
 #' Inserts or updates chunks in a `RagnarStore`
 #'
-#' @inheritParams ragnar_store_insert
-#' @param chunks Content to update. The precise input structure depends on
-#'   `store@version`. See Details.
+#' @param store a `RagnarStore` object
+#' @param chunks Content to insert or update. The precise input structure
+#'   depends on `store@version`. See Details.
 #' @details
 #'
 #' **Store Version 2**
@@ -286,6 +293,17 @@ ragnar_store_connect <- function(
 #'
 #' @returns `store`, invisibly.
 #' @export
+ragnar_store_insert <- function(store, chunks) {
+  switch(
+    store@version,
+    ragnar_store_insert_v1(store, chunks),
+    ragnar_store_insert_v2(store, chunks)
+  )
+  invisible(store)
+}
+
+#' @rdname ragnar_store_insert
+#' @export
 ragnar_store_update <- function(store, chunks) {
   switch(
     store@version,
@@ -294,24 +312,6 @@ ragnar_store_update <- function(store, chunks) {
   )
   invisible(store)
 }
-
-#' Insert chunks into a `RagnarStore`
-#'
-#' @param store a `RagnarStore` object
-#' @param chunks a character vector or a dataframe with a `text` column, and
-#'   optionally, a pre-computed `embedding` matrix column. If `embedding` is not
-#'   present, then `store@embed()` is used. `chunks` can also be a character
-#'   vector.
-#' @returns `store`, invisibly.
-#' @export
-ragnar_store_insert <- function(store, chunks) {
-  switch(
-    store@version,
-    ragnar_store_insert_v1(store, chunks),
-    ragnar_store_insert_v2(store, chunks)
-  )
-}
-
 
 #' Build a Ragnar Store index
 #'

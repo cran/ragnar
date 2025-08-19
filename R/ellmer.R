@@ -19,7 +19,7 @@
 #'   When responding, you first quote relevant material from books or documentation,
 #'   provide links to the sources, and then add your own context and interpretation.
 #' ")
-#' chat <- ellmer::chat_openai(system_prompt, model = "gpt-4o")
+#' chat <- ellmer::chat_openai(system_prompt, model = "gpt-4.1")
 #'
 #' store <- ragnar_store_connect("r4ds.ragnar.duckdb")
 #' ragnar_register_tool_retrieve(chat, store)
@@ -42,29 +42,36 @@ ragnar_register_tool_retrieve <- function(
   name <- name %||% glue::glue("rag_retrieve_from_{store@name}")
   title <- title %||% store@title
 
-  withr::local_options(lifecycle_verbosity = "quiet")
-  tool_def <- suppressWarnings(suppressMessages(
-    ## TODO: ellmer::tool() changed in dev version (slated next v0.3.0)
-    ## need to update once ellmer v0.3.0 is on CRAN
-    ellmer::tool(
-      .name = name,
-      function(text) {
-        chunks <- ragnar_retrieve(store, text, ...)
-        chunks
-      },
-      glue::glue(
-        "Given a string, retrieve the most relevant excerpts from {store_description}."
-      ),
+  previously_retrieved_chunk_ids <- integer()
+
+  tool_def <- ellmer::tool(
+    function(text) {
+      chunks <- ragnar_retrieve(
+        store,
+        text,
+        ...,
+        filter = !.data$chunk_id %in% previously_retrieved_chunk_ids
+      )
+      previously_retrieved_chunk_ids <<-
+        unique(unlist(c(chunks$chunk_id, previously_retrieved_chunk_ids)))
+      chunks
+    },
+    name = name,
+    description = glue::glue(
+      "Given a string, retrieve the most relevant excerpts from {store_description}. Previously retrieved chunks are not returned; repeated searches of the same query will return unique results."
+    ),
+    arguments = list(
       text = ellmer::type_string(
         "The text to find the most relevant matches for."
-      ),
-      .annotations = ellmer::tool_annotations(
-        title = title,
-        read_only_hint = TRUE,
-        open_world_hint = FALSE
       )
+    ),
+    annotations = ellmer::tool_annotations(
+      title = title,
+      read_only_hint = TRUE,
+      open_world_hint = FALSE
     )
-  ))
+  )
+
   chat$register_tool(tool_def)
   invisible(chat)
 }

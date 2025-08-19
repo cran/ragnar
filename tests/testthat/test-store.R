@@ -222,6 +222,7 @@ test_that("additional columns", {
 
 test_that("Allow a NULL embedding function", {
   skip_on_cran() # See comment in test-retrieve.R
+  skip_if_cant_load_duckdb_extensions()
   store <- ragnar_store_create(embed = NULL, version = 1)
   maybe_set_threads(store)
   chunks <- data.frame(
@@ -277,21 +278,37 @@ test_that("works with MotherDuck", {
 })
 
 test_that("embed functions get the defaults stored", {
-  store <- ragnar_store_create(embed = function(x) ragnar::embed_openai(x))
+  store <- ragnar_store_create(
+    embed = function(x) ragnar::embed_openai(x),
+    embedding_size = 256
+  )
   expect_snapshot(store@embed)
 
   # here embed_openai is implicitly obtained from ragnar::embed_openai
-  store <- ragnar_store_create(embed = function(x) embed_openai(x))
+  store <- ragnar_store_create(
+    embed = function(x) embed_openai(x),
+    embedding_size = 256
+  )
   expect_snapshot(store@embed)
 
   # if the embed function takes ..., they're preserved
   store <- ragnar_store_create(
-    embed = function(x, ...) ragnar::embed_openai(x, ...)
+    embed = function(x, ...) ragnar::embed_openai(x, ...),
+    embedding_size = 256
   )
   expect_snapshot(store@embed)
 
   # when using the partialized version, we should also add the defaults
-  store <- ragnar_store_create(embed = embed_openai())
+  store <- ragnar_store_create(embed = embed_openai(), embedding_size = 256)
+  expect_snapshot(store@embed)
+
+  my_model <- "amazon.titan-embed-text-v1"
+  store <- ragnar_store_create(
+    embed = \(x) {
+      ragnar::embed_bedrock(x, model = my_model, profile = "default")
+    },
+    embedding_size = 256
+  )
   expect_snapshot(store@embed)
 
   # test other embed funcs
@@ -302,6 +319,7 @@ test_that("embed functions get the defaults stored", {
 
 test_that("store v1 accepts markdown chunks (from v2)", {
   skip_on_cran() # See comment in test-retrieve.R
+  skip_if_cant_load_duckdb_extensions()
   store <- ragnar_store_create(
     version = 1,
     embed = \(x) matrix(nrow = length(x), ncol = 100, stats::runif(100))

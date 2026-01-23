@@ -349,7 +349,7 @@ ragnar_read_document <- function(
 #'
 #' @param url_filter A function that takes a character vector of URL's and may
 #'   subset them to return a smaller list. This can be useful for filtering out
-#'   URL's by rules different them `children_only` which only checks the prefix.
+#'   URL's by rules different than `children_only` which only checks the prefix.
 #'
 #' @param validate Default is `FALSE`. If `TRUE` sends a `HEAD` request for each
 #'   link and removes those that are not accessible. Requests are sent in parallel
@@ -362,8 +362,6 @@ ragnar_read_document <- function(
 #' \dontrun{
 #' ragnar_find_links("https://r4ds.hadley.nz/base-R.html")
 #' ragnar_find_links("https://ellmer.tidyverse.org/")
-#' ragnar_find_links("https://ellmer.tidyverse.org/", depth = 2)
-#' ragnar_find_links("https://ellmer.tidyverse.org/", depth = 2, children_only = FALSE)
 #' ragnar_find_links(
 #'   paste0("https://github.com/Snowflake-Labs/sfquickstarts/",
 #'          "tree/master/site/sfguides/src/build_a_custom_model_for_anomaly_detection"),
@@ -374,7 +372,7 @@ ragnar_read_document <- function(
 ragnar_find_links <- function(
   x,
   depth = 0L,
-  children_only = TRUE,
+  children_only = FALSE,
   progress = TRUE,
   ...,
   url_filter = identity,
@@ -479,7 +477,7 @@ ragnar_find_links <- function(
     cli::cli_progress_update(force = TRUE)
   }
 
-  out <- visited$union(collected)
+  out <- collected
   get_resolved <- reticulate::py_to_r(resolved$get)
   out <- reticulate::iterate(out, \(x) get_resolved(x) %||% x)
   out <- out[nzchar(out)]
@@ -593,6 +591,9 @@ stri_subset_startswith_fixed <- function(str, pattern, ...) {
 read_html2 <- function(url, ...) {
   # For some reason curl is both erroring and warning when the URL is invalid or
   # returns 404. We don't really want the warnings, so we discard them.
+  if (!is_url(url)) {
+    return(xml2::read_html(url, ...))
+  }
   suppressWarnings({
     handle <- curl::new_handle(followlocation = TRUE)
     # We first try the original URL, if some error occurs we retry with the
@@ -614,6 +615,10 @@ read_html2 <- function(url, ...) {
   out <- xml2::read_html(conn, ...)
   attr(out, "resolved_url") <- curl::handle_data(handle)$url
   out
+}
+
+is_url <- function(path) {
+  grepl("^(http|ftp)s?://", path)
 }
 
 xml_url2 <- function(x) {

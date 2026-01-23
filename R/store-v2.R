@@ -28,11 +28,14 @@ ragnar_store_create_v2 <- function(
     )
   }
 
+  # make sure to force and process `embed()` before forcing `embedding_size`
+  embed <- process_embed_func(embed)
+  # serialize `embed()` before forcing it's first call, in case it
+  # has a self-defusing initialization hook.
+  embed_func_blob <- blob::blob(serialize(embed, NULL))
   if (is.null(embed)) {
     embedding_size <- NULL
   } else {
-    # make sure to force and process `embed()` before forcing `embedding_size`
-    embed <- process_embed_func(embed)
     check_number_whole(embedding_size, min = 0)
     embedding_size <- as.integer(embedding_size)
 
@@ -44,7 +47,7 @@ ragnar_store_create_v2 <- function(
 
   metadata <- data_frame(
     embedding_size = embedding_size,
-    embed_func = blob::blob(serialize(embed, NULL)),
+    embed_func = embed_func_blob,
     name = name,
     title = title
   )
@@ -118,6 +121,8 @@ ragnar_store_create_v2 <- function(
         USING
           (doc_id)
       );
+
+      SET enable_progress_bar = false;
     )--"
     )
   )
@@ -127,6 +132,7 @@ ragnar_store_create_v2 <- function(
   )
 
   DuckDBRagnarStore(
+    location = normalizePath(location, winslash = "/", mustWork = FALSE),
     embed = embed,
     con = con,
     name = name,
@@ -298,10 +304,10 @@ ragnar_store_update_v2 <- function(store, chunks) {
 
   con <- store@con
 
-  join_cols <- store@schema |>
-    select(-doc_id, -embedding) |>
-    names() |>
-    c("text")
+  join_cols <- setdiff(
+    c(dbListFields(con, "embeddings"), "text"),
+    c("doc_id", "chunk_id", "embedding")
+  )
 
   existing <- tbl(con, "chunks") |>
     filter(origin == !!chunks@document@origin) |>
@@ -329,8 +335,7 @@ ragnar_store_update_v2 <- function(store, chunks) {
   }
 
   embeddings <- chunks |>
-    select(any_of(dbListFields(con, "embeddings"))) |>
-    vctrs::vec_cast(store@schema)
+    select(any_of(dbListFields(con, "embeddings")))
 
   dbWithTransaction2(con, {
     doc_id <- unique(existing$doc_id)
@@ -410,8 +415,7 @@ ragnar_store_insert_v2 <- function(
   )
 
   embeddings <- chunks |>
-    select(any_of(dbListFields(con, "embeddings"))) |>
-    vctrs::vec_cast(store@schema)
+    select(any_of(dbListFields(con, "embeddings")))
 
   # TODO: rename embeddings -> chunks_info?
 

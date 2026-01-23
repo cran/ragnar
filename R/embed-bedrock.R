@@ -6,7 +6,7 @@
 #'   There are no guardarails for the kind of model that is used, but the model
 #'   must be available in the AWS region specified by the profile.
 #'   You may look for available models in the Bedrock Model Catalog
-#' @param profile AWS profile to use.
+#' @param profile AWS profile to use. It's passed to [paws.common::locate_credentials] to locate AWS credentials.
 #' @param api_args Additional arguments to pass to the Bedrock API. Depending
 #'   on the `model`, you might be able to provide different parameters. Check
 #'   the documentation for the model you are using in the
@@ -19,7 +19,7 @@
 #' If `x` is not missing, a matrix of embeddings with 1 row per input string, or a dataframe with an 'embedding' column.
 #'
 #' @export
-embed_bedrock <- function(x, model, profile, api_args = list()) {
+embed_bedrock <- function(x, model, profile = "", api_args = list()) {
   if (missing(x) || is.null(x)) {
     args <- capture_args()
     fn <- partial(quote(ragnar::embed_bedrock), alist(x = ), args)
@@ -47,20 +47,13 @@ embed_bedrock <- function(x, model, profile, api_args = list()) {
     return(NULL) # Return early if there are no inputs
   }
 
-  req <- httr2::request(paste0(
-    "https://bedrock-runtime.",
-    credentials$region,
-    ".amazonaws.com"
-  )) |>
-    req_user_agent(ragnar_user_agent())
+  req <- httr2::request(
+    paste0("https://bedrock-runtime.", credentials$region, ".amazonaws.com")
+  ) |>
+    req_user_agent(ragnar_user_agent()) |>
+    embed_req_retry()
 
-  req <- httr2::req_url_path_append(
-    req,
-    "model",
-    model,
-    "invoke"
-  )
-
+  req <- httr2::req_url_path_append(req, "model", model, "invoke")
   req <- httr2::req_error(req, body = function(resp) {
     body <- httr2::resp_body_json(resp)
     body$Message %||% body$message
@@ -117,7 +110,7 @@ embed_bedrock_cohere <- function(base_req, inputs, api_args, req_auth_bedrock) {
   matrix(
     unlist(out),
     nrow = length(inputs),
-    ncol = length(out[[1]]),
+    ncol = length(out[[1L]]),
     byrow = TRUE
   )
 }
@@ -133,10 +126,7 @@ embed_bedrock_titan <- function(base_req, inputs, api_args, req_auth_bedrock) {
   # }
   # only works with a single input at a time
   out <- lapply(inputs, function(input) {
-    body <- rlang::list2(
-      inputText = input,
-      !!!api_args
-    )
+    body <- rlang::list2(inputText = input, !!!api_args)
 
     resp <- base_req |>
       httr2::req_body_json(body) |>

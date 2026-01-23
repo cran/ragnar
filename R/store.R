@@ -134,7 +134,7 @@ unique_store_name <- function() {
 }
 
 process_embed_func <- function(embed) {
-  if (inherits(embed, "crate")) {
+  if (is.null(embed) || inherits(embed, "crate")) {
     return(embed)
   }
   og_embed_env <- environment(embed)
@@ -260,6 +260,7 @@ ragnar_store_connect <- function(
   attr(ptr, "embed_function") <- embed
 
   DuckDBRagnarStore(
+    location = normalizePath(location, winslash = "/", mustWork = FALSE),
     embed = embed,
     schema = schema,
     con = con,
@@ -340,10 +341,11 @@ ragnar_store_build_index <- function(store, type = c("vss", "fts")) {
 # store is inherently stateful and S7 is better suited to stateless objects.
 RagnarStore := new_class(
   properties = list(
+    location = prop_string(),
     embed = S7::new_union(class_function, NULL),
     schema = NULL | class_data.frame,
-    name = class_character,
-    title = S7::new_union(NULL, class_character)
+    name = prop_string(),
+    title = prop_string(allow_null = TRUE)
   ),
   abstract = TRUE
 )
@@ -372,11 +374,13 @@ local({
     cat(glue(
       '
     <ragnar::DuckDBRagnarStore>
+     @ location: {x@location}
      @ embed   : {embed}
      @ name    : {x@name}
      @ title   : {x@title %||% "NULL"}
      @ con     : <DBI::DBIConnection>
      @ version : {x@version}
+
     '
     ))
   }
@@ -391,12 +395,38 @@ local({
 })
 
 
-#' Launches the Ragnar Inspector Tool
+#' Launch the Ragnar Store Inspector
 #'
-#' @param store A `RagnarStore` object that you want to inspect with the tool.
+#' Launches a Shiny app for interactively browsing a Ragnar store, previewing
+#' document chunks, and testing search behavior.
+#'
+#' @param store A `RagnarStore` object to inspect.
 #' @param ... Passed to [shiny::runApp()].
 #'
-#' @returns `NULL` invisibly
+#' @returns `NULL` (invisibly).
+#'
+#' @details
+#'
+#' The Store Inspector is a Shiny app for exploring a `RagnarStore`. Use it to
+#' quickly see what was ingested and preview search results for different
+#' queries. Type a query in the search bar and choose BM25 or VSS. The list of
+#' documents on the left updates, and clicking a row shows its text and metadata
+#' on the right. You can drag the divider to resize the document list and
+#' preview area.
+#'
+#' The preview area shows the chunk content. You can view it as rendered
+#' Markdown or switch to “Raw Text” to see the stored text (long lines are
+#' wrapped). Metadata is shown above the text in YAML format, including any
+#' extra fields stored with the chunk.
+#'
+#' @section Keyboard Shortcuts:
+#'
+#' | *Context*        | *Shortcut*                                      | *Action*                |
+#' |------------------|-------------------------------------------------|-------------------------|
+#' | Global           | `/`, `Esc`                                      | Focus search; clear it  |
+#' | Documents list   | `ArrowUp`/`ArrowDown`, `j`/`k`                  | Move selection          |
+#' | Vertical Divider | `ArrowLeft`/`ArrowRight` (+`Shift`), `g`/`Home` | Resize; reset           |
+#'
 #'
 #' @export
 ragnar_store_inspect <- function(store, ...) {
@@ -405,5 +435,59 @@ ragnar_store_inspect <- function(store, ...) {
   withr::with_options(list(ragnar_inspector_store = store), {
     shiny::runApp(app_dir, ...)
   })
+  invisible(NULL)
+}
+
+#' Visualize a store using Embedding Atlas
+#'
+#' @inheritParams ragnar_store_inspect
+#' @param port Port to run the Embedding Atlas server on.
+#' @param host Host to run the Embedding Atlas server on.
+#' @param launch.browser Whether to launch the browser automatically.
+#'
+#' @note This function requires the `embedding-atlas` Python package.
+#' Make sure you have it installed in your reticulate Python environment.
+#' It also uses `arrow` to transfer data from the DuckDB store to Python.
+#'
+#' @examples
+#' \dontrun{
+#' # Connect or create a store
+#' store <- ragnar_store_connect(':memory:')
+#' # Launch the Embedding Atlas app
+#' ragnar_store_atlas(store)
+#' }
+#'
+#'
+#' @export
+ragnar_store_atlas <- function(
+  store,
+  ...,
+  host = "localhost",
+  port = 3030,
+  launch.browser = interactive()
+) {
+  # duckdb R version need to match the Python version at least in major.minor
+  duckdb_version <- numeric_version(utils::packageVersion("duckdb"))
+
+  reticulate::py_require(c(
+    "embedding-atlas",
+    sprintf("duckdb==%s.%s.*", duckdb_version$major, duckdb_version$minor),
+    "numba>=0.62.0rc2",
+    "llvmlite>=0.45.0rc2"
+  ))
+  atlas <- reticulate::import_from_path(
+    "_ragnartools.atlas",
+    system.file("python", package = "ragnar")
+  )
+  df <- duckdb::duckdb_fetch_arrow(DBI::dbSendQuery(
+    store@con,
+    "SELECT * FROM chunks;",
+    arrow = TRUE
+  ))
+  join_thread <- atlas$run_embedding_atlas(df, host, as.integer(port))
+  if (launch.browser) {
+    utils::browseURL(sprintf("http://%s:%d", host, port))
+  }
+  join_thread()
   invisible(NULL)
 }

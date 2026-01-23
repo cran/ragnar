@@ -2,7 +2,7 @@
 #' @inheritParams embed_openai
 #' @inheritParams ellmer::chat_google_vertex
 #' @param model Character specifying the embedding model.
-#' See supported models in [Text embeddings API](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api)
+#' See supported models in [Text embeddings API](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api)
 #' @param task_type Used to convey intended downstream application to help the
 #' model produce better embeddings. If left blank, the default used is `"RETRIEVAL_QUERY"`.
 #' - `"RETRIEVAL_QUERY"`
@@ -13,7 +13,7 @@
 #' - `"QUESTION_ANSWERING"`
 #' - `"FACT_VERIFICATION"`
 #' - `"CODE_RETRIEVAL_QUERY"`
-#' For more information about task types, see [Choose an embeddings task type](https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/task-types).
+#' For more information about task types, see [Choose an embeddings task type](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/embeddings/task-types).
 #' @examples
 #' \dontrun{
 #' embed_google_vertex(
@@ -61,6 +61,7 @@ embed_google_vertex <- function(
 
   base_req <- vertex_url(location, project_id) |>
     httr2::request() |>
+    embed_req_retry() |>
     req_user_agent(ragnar_user_agent()) |>
     httr2::req_headers(!!!credentials, .redact = names(credentials)) |>
     httr2::req_url_path_append(

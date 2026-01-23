@@ -7,8 +7,10 @@
 read_as_markdown(
   path,
   ...,
+  origin = path,
   html_extract_selectors = c("main"),
-  html_zap_selectors = c("nav")
+  html_zap_selectors = c("nav"),
+  youtube_transcript_formatter = NULL
 )
 }
 \arguments{
@@ -20,6 +22,9 @@ transcription), HTML, text-based formats (CSV, JSON, XML), ZIP files
 
 \item{...}{Passed on to \code{MarkItDown.convert()}.}
 
+\item{origin}{The value to use for the \verb{@origin} property of the returned
+\code{MarkdownDocument}.}
+
 \item{html_extract_selectors}{Character vector of CSS selectors. If a match
 for a selector is found in the document, only the matched node's contents
 are converted. Unmatched extract selectors have no effect.}
@@ -29,6 +34,15 @@ matching these selectors will be excluded ("zapped") from the HTML document
 before conversion to markdown. This is useful for removing navigation bars,
 sidebars, headers, footers, or other unwanted elements. By default,
 navigation elements (\code{nav}) are excluded.}
+
+\item{youtube_transcript_formatter}{A function used to customize how YouTube
+transcript data is converted to markdown. It receives a tibble/data.frame
+with columns \code{text} (chr), \code{start} (dbl, seconds), and \code{duration} (dbl,
+seconds), along with a \code{"youtube_metadata"} attribute, a named list
+containing elements \code{language}, \code{language_code}, \code{video_id}, and
+\code{is_generated}. The formatter must return a single string; by default it
+behaves like \verb{\\(transcript) paste0(transcript$text, collapse = " ")}.
+Provide a custom formatter to include timestamps or links (see examples).}
 }
 \value{
 A \code{\link{MarkdownDocument}} object, which is a single string of Markdown
@@ -130,5 +144,52 @@ if (
   chat <- ellmer::chat_openai(echo = TRUE)
   chat$chat("Describe this image", ellmer::content_image_file(jpg))
 }
+
+# YouTube transcripts
+## read_as_markdown() fetches transcripts for YouTube links
+cat_head(read_as_markdown("https://youtu.be/GELhdezYmP0"))
+
+## The default transcript omits timestamps. Supply a custom
+## `youtube_transcript_formatter` to control the output. This example formats
+## the transcript with timestamped YouTube links.
+
+format_youtube_timestamp <- function(time) {
+  h <- time \%/\% 3600
+  time <- time \%\% 3600
+  m <- time \%/\% 60
+  time <- time \%\% 60
+  s <- floor(time)
+  out <- paste0(h, "h", m, "m", s, "s")
+  out <- sub("^0h", "", out)
+  out <- sub("^0m", "", out)
+  out
+}
+
+format_transcript_with_timestamps <-
+  function(data, min_timestamp_stride_seconds = 30, links = FALSE) {
+    ts <- format_youtube_timestamp(data$start)
+    if (links) {
+      video_id <- attr(data, "youtube_metadata")$video_id
+      ts <- sprintf("\n<https://youtu.be/\%s?t=\%s>\n", video_id, ts)
+    } else {
+      ts <- sprintf("\n[\%s] ", ts)
+    }
+
+    if (!is.null(min_timestamp_stride_seconds)) {
+      show <- c(TRUE, as.logical(diff(x \%/\% min_timestamp_stride_seconds)))
+      ts[!show] <- ""
+    }
+
+    paste0(ts, data$text, sep = "", collapse = "\n")
+  }
+
+
+read_as_markdown(
+  "https://www.youtube.com/watch?v=GELhdezYmP0",
+  youtube_transcript_formatter = \(data) {
+    format_transcript_with_timestamps(data, links = TRUE)
+  }
+) |>
+  cat_head(n = 60)
 }
 }

@@ -38,6 +38,7 @@ embed_google_gemini <- function(
 
   base_req <- base_url |>
     httr2::request() |>
+    embed_req_retry() |>
     req_user_agent(ragnar_user_agent()) |>
     httr2::req_headers_redacted("x-goog-api-key" = api_key) |>
     httr2::req_url_path_append(
@@ -50,13 +51,13 @@ embed_google_gemini <- function(
     })
 
   out <- list()
-  
+
   base_body <- body <- list(
     taskType = task_type,
     model = paste0("models/", model)
   )
   if (!is.null(dims)) {
-      base_body$outputDimensionality <- dims
+    base_body$outputDimensionality <- dims
   }
 
   for (indices in chunk_list(seq_along(x), batch_size)) {
@@ -65,7 +66,7 @@ embed_google_gemini <- function(
       body$content <- list(parts = list(list(text = x[[i]])))
       body
     })
-  
+
     resp <- base_req |>
       httr2::req_body_json(list(requests = requests)) |>
       httr2::req_perform() |>

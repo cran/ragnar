@@ -328,7 +328,7 @@ ragnar_retrieve_bm25_tbl <- function(tbl, text, top_k) {
       metric_name = "bm25"
     ) |>
     filter(sql('metric_value IS NOT NULL')) |>
-    arrange(.data$metric_value) |>
+    arrange(desc(.data$metric_value)) |>
     select(-"embedding") |>
     head(n = top_k) |>
     collect()
@@ -362,6 +362,9 @@ calculate_vss <- function(store, text, method) {
 #'
 #' BM25 refers to Okapi Best Matching 25. See \doi{10.1561/1500000019} for more
 #' information.
+#'
+#' @return A tibble ordered by descending BM25 `metric_value` (higher is more
+#'   relevant), with a `metric_name` column set to "bm25".
 #'
 #' @param conjunctive	Whether to make the query conjunctive i.e., all terms in
 #'   the query string must be present in order for a chunk to be retrieved.
@@ -411,7 +414,7 @@ ragnar_retrieve_bm25 <- function(
   tbl <- dplyr::filter(tbl, !!!filters)
 
   sql_query <- tbl |>
-    arrange(metric_value) |>
+    arrange(desc(metric_value)) |>
     select(-any_of("embedding")) |>
     head(n = top_k) |>
     dbplyr::remote_query()
@@ -511,7 +514,13 @@ ragnar_retrieve_vss_and_bm25 <- function(store, text, top_k = 3, ...) {
 #' ragnar_retrieve(store, "sweet", filter = category == "dessert")
 #' @export
 ragnar_retrieve <- function(store, text, top_k = 3L, ..., deoverlap = TRUE) {
-  chunks <- ragnar_retrieve_vss_and_bm25(store, text, top_k, ...)
+  chunks <- do.call(
+    vec_rbind,
+    lapply(text, function(.text) {
+      ragnar_retrieve_vss_and_bm25(store, .text, top_k, ...)
+    })
+  )
+
   if (!S7_inherits(store, RagnarStore)) {
     # back-compat with tbl() supplied for store
     return(chunks)
@@ -521,11 +530,14 @@ ragnar_retrieve <- function(store, text, top_k = 3L, ..., deoverlap = TRUE) {
     {
       # @version == 1
       chunks[["hash"]] <- NULL
+      chunks <- distinct(chunks)
     },
     {
       # @version == 2
       if (deoverlap) {
         chunks <- chunks_deoverlap(store, chunks)
+      } else {
+        chunks <- distinct(chunks, doc_id, chunk_id, .keep_all = TRUE)
       }
     }
   )
@@ -555,6 +567,7 @@ chunks_deoverlap <- function(store, chunks) {
   }
   deoverlapped <- chunks |>
     mutate(embedding = NULL) |>
+    distinct(doc_id, chunk_id, .keep_all = TRUE) |>
     arrange(origin, doc_id, start) |>
     mutate(
       .by = c(origin, doc_id),

@@ -11,12 +11,10 @@
 #'   stri_trim_right
 #' @importFrom xml2 xml_add_sibling xml_find_all xml_name xml_attr xml_text
 #'   xml_url url_absolute xml_contents xml_find_first
-#' @importFrom dplyr tibble as_tibble
-#' @importFrom dplyr bind_rows coalesce distinct filter join_by left_join mutate
+#' @importFrom dplyr tibble as_tibble bind_rows coalesce distinct filter join_by left_join mutate
 #'   na_if rename rename_with select slice_max slice_min starts_with collect
-#'   summarize row_number anti_join lag any_of all_of across lag
+#'   summarize row_number anti_join lag any_of all_of across lag desc
 #' @importFrom tidyr unchop unnest
-#' @importFrom tidyr unchop
 #' @importFrom vctrs data_frame vec_split vec_rbind vec_cbind vec_locate_matches
 #'   vec_fill_missing vec_unique vec_slice vec_c list_unchop new_data_frame
 #'   vec_chop vec_ptype vec_proxy vec_restore
@@ -38,6 +36,8 @@ NULL
   function(x, y) tryCatch(x, error = function(e) y)
 )
 
+# fmt: skip
+{
 `%empty%` <- function(x, y) if (length(x)) x else y
 `add<-` <- function(x, value) x + value
 first <- function(x) x[[1L]]
@@ -45,10 +45,13 @@ last <- function(x) x[[length(x)]]
 drop_last <- function(x) x[-length(x)]
 drop_first <- function(x) x[-1L]
 drop_nulls <- function(x) x[!vapply(x, is.null, FALSE, USE.NAMES = FALSE)]
+keep <- function(.x, .f, ...)  .x[vapply(X = .x, FUN = .f, FUN.VALUE = FALSE, ..., USE.NAMES = FALSE)]
+drop <- function(.x, .f, ...)  .x[!vapply(X = .x, FUN = .f, FUN.VALUE = FALSE, ..., USE.NAMES = FALSE)]
 
 map_chr <- function(.x, .f, ...) vapply(X = .x, FUN = .f, FUN.VALUE = "", ...)
 map_int <- function(.x, .f, ...) vapply(X = .x, FUN = .f, FUN.VALUE = 0L, ...)
 map_lgl <- function(.x, .f, ...) vapply(X = .x, FUN = .f, FUN.VALUE = TRUE, ...)
+}
 
 map2 <- function(.x, .y, .f, ...) {
   out <- .mapply(.f, list(.x, .y), list(...))
@@ -297,17 +300,18 @@ can_load_duckdb_extensions <- local({
   can <- NULL
   function() {
     if (is.null(can)) {
-      can <<- 0 == system2(
-        rscript_exe(),
-        "-",
-        input = c(
-          "con <- DBI::dbConnect(duckdb::duckdb())",
-          "DBI::dbExecute(con, 'INSTALL fts; LOAD fts;')",
-          "DBI::dbExecute(con, 'INSTALL vss; LOAD vss;')"
-        ),
-        stderr = FALSE,
-        stdout = FALSE
-      )
+      can <<- 0L ==
+        system2(
+          rscript_exe(),
+          "-",
+          input = c(
+            "con <- DBI::dbConnect(duckdb::duckdb())",
+            "DBI::dbExecute(con, 'INSTALL fts; LOAD fts;')",
+            "DBI::dbExecute(con, 'INSTALL vss; LOAD vss;')"
+          ),
+          stderr = FALSE,
+          stdout = FALSE
+        )
     }
     can
   }
@@ -320,3 +324,10 @@ rscript_exe <- function() {
   )
 }
 
+parent.pkg <- function(env = parent.frame(2L)) {
+  if (isNamespace(env <- topenv(env))) {
+    as.character(getNamespaceName(env)) # unname
+  } else {
+    NULL # print visible
+  }
+}

@@ -7,7 +7,7 @@
 ragnar_find_links(
   x,
   depth = 0L,
-  children_only = TRUE,
+  children_only = FALSE,
   progress = TRUE,
   ...,
   url_filter = identity,
@@ -33,7 +33,7 @@ when \code{depth > 0}.}
 
 \item{url_filter}{A function that takes a character vector of URL's and may
 subset them to return a smaller list. This can be useful for filtering out
-URL's by rules different them \code{children_only} which only checks the prefix.}
+URL's by rules different than \code{children_only} which only checks the prefix.}
 
 \item{validate}{Default is \code{FALSE}. If \code{TRUE} sends a \code{HEAD} request for each
 link and removes those that are not accessible. Requests are sent in parallel
@@ -49,8 +49,6 @@ Find links on a page
 \dontrun{
 ragnar_find_links("https://r4ds.hadley.nz/base-R.html")
 ragnar_find_links("https://ellmer.tidyverse.org/")
-ragnar_find_links("https://ellmer.tidyverse.org/", depth = 2)
-ragnar_find_links("https://ellmer.tidyverse.org/", depth = 2, children_only = FALSE)
 ragnar_find_links(
   paste0("https://github.com/Snowflake-Labs/sfquickstarts/",
          "tree/master/site/sfguides/src/build_a_custom_model_for_anomaly_detection"),

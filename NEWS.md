@@ -1,3 +1,26 @@
+# ragnar 0.3.1
+
+-   `ragnar_store_atlas()` now works with Embedding Atlas >= 0.20.0 and uses
+    `nanoarrow` instead of `arrow` for data transfer (#168).
+
+-   `chunks_deoverlap()` now accepts empty input, so `ragnar_retrieve()` no
+    longer errors when all chunks are filtered out (#174).
+
+-   `embed_openai()` now accepts integer `dims` values (#175).
+
+-   ragnar now disables ONNX Runtime telemetry (#177).
+
+-   ragnar now requires Python < 3.14 to avoid incompatible MarkItDown
+    dependencies.
+
+-   ragnar can now load without an import warning with development versions of S7.
+
+-   `ragnar_store_ingest()` now uses the updated `mirai::race_mirai()` API.
+    ragnar now requires mirai >= 2.6.0 (#159).
+
+-   The documentation for `MarkdownDocument()` and `MarkdownDocumentChunks()`
+    now includes constructor usage.
+
 # ragnar 0.3.0
 
 ## Breaking changes

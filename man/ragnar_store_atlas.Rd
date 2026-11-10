@@ -28,17 +28,17 @@ Visualize a store using Embedding Atlas
 }
 \note{
 This function requires the \code{embedding-atlas} Python package (>= 0.20.0)
-in your reticulate Python environment, the \code{duckdb} R package (>= 1.4.0),
+in your reticulate Python environment, the \code{duckdb} R package (>= 1.5.0),
 and \code{nanoarrow} (>= 0.8.0) to transfer data from the DuckDB store to Python.
 }
 \examples{
 \dontrun{
 # Start Ollama, then run this in a terminal:
-# ollama pull embeddinggemma:300m-qat-q4_0
+# ollama pull embeddinggemma-2:270m-q8_0-text
 
 # Create an in-memory store using local embeddings
 store <- ragnar_store_create(
-  embed = embed_ollama(model = "embeddinggemma:300m-qat-q4_0")
+  embed = embed_ollama()
 )
 
 # Read and embed a chapter from R for Data Science

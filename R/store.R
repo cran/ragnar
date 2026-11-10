@@ -15,6 +15,11 @@
 #' easiest way to prepare `chunks` for `version = 2` is with
 #' `read_as_markdown()` and `markdown_chunk()`.
 #'
+#' Older v2 stores can be opened read-only without changing the store.
+#' Opening one with `read_only = FALSE` upgrades its schema on disk. Existing
+#' documents have unknown freshness and are reprocessed when their sources are
+#' next ingested; later runs can skip unchanged sources.
+#'
 #' **Version 1 – flat chunks**
 #'
 #' With `version = 1`, ragnar keeps all chunks in a single table. This lets you
@@ -25,7 +30,25 @@
 #' Additionally, if you intend to call `ragnar_store_update()`, it is your
 #' responsibility to provide `rlang::hash(original_full_document)` with each
 #' chunk. The easiest way to prepare `chunks` for `version = 1` is with
-#' `ragnar_read()` and `ragnar_chunk()`.
+#' `read_as_markdown()` and `markdown_chunk()`.
+#'
+#' ## Memory use
+#'
+#' Store connections disable DuckDB's insertion-order preservation to reduce
+#' memory use. Use an explicit `ORDER BY` when querying the connection directly
+#' if row order matters.
+#'
+#' DuckDB sets a default `memory_limit` based on available system memory. For
+#' deployments with a smaller process memory budget, lower this limit after
+#' creating or connecting to a store, for example:
+#'
+#' ```r
+#' DBI::dbExecute(store@con, "SET memory_limit = '4GB'")
+#' ```
+#'
+#' Choose a limit that leaves room for R and other allocations. This setting
+#' limits DuckDB's buffer manager, not total process memory; HNSW indexes and
+#' some other allocations are outside this limit.
 #'
 #' @param location filepath, or `:memory:`. Location can also be a database name
 #'   specified with `md:dbname`, in this case the database will be created in
@@ -110,6 +133,9 @@ ragnar_store_create <- function(
   title = NULL,
   version = 2
 ) {
+  if (is_windows_arm64()) {
+    stop("DuckDB stores are not currently supported on Windows ARM64.", call. = FALSE)
+  }
   check_number_whole(version)
   create <- switch(
     as.integer(version),
@@ -225,6 +251,9 @@ ragnar_store_connect <- function(
   ...,
   read_only = TRUE
 ) {
+  if (is_windows_arm64()) {
+    stop("DuckDB stores are not currently supported on Windows ARM64.", call. = FALSE)
+  }
   check_dots_empty()
 
   if (is_motherduck_location(location)) {
@@ -237,6 +266,7 @@ ragnar_store_connect <- function(
       array = "matrix"
     )
   }
+  dbExecute(con, "SET preserve_insertion_order = false")
 
   tables <- dbListTables(con)
   if (all(c("documents", "embeddings", "metadata") %in% tables)) {
@@ -249,6 +279,15 @@ ragnar_store_connect <- function(
 
   dbExecute(con, "INSTALL fts; INSTALL vss;")
   dbExecute(con, "LOAD fts; LOAD vss;")
+
+  # Read-only connections never use the fields added by the upgrade.
+  if (
+    version == 2L &&
+      !read_only &&
+      !"content_hash" %in% dbListFields(con, "documents")
+  ) {
+    upgrade_v2_store(con)
+  }
 
   metadata <- dbReadTable(con, "metadata")
   embed <- unserialize(metadata$embed_func[[1L]])
@@ -312,6 +351,203 @@ ragnar_store_update <- function(store, chunks) {
     ragnar_store_update_v2(store, chunks)
   )
   invisible(store)
+}
+
+#' Remove stale documents from a Ragnar store
+#'
+#' `ragnar_store_sync()` deletes any documents whose `origin` is not in `keep`,
+#' along with their embeddings. Use `dry_run = TRUE` to
+#' preview what would be deleted without modifying the store.
+#'
+#' @param store A `DuckDBRagnarStore` (version 2 only).
+#' @param keep Character vector of origin URLs or file paths to retain.
+#'   All other origins currently in the store are deleted.
+#' @param dry_run Logical. If `TRUE`, return a summary tibble of what would
+#'   be deleted without making any changes. Default `FALSE`.
+#' @param rebuild_index Logical. If `TRUE` (default), rebuild search indexes
+#'   after deletion via [ragnar_store_build_index()].
+#'
+#' @returns When `dry_run = FALSE`: `store` invisibly, with a `sync_summary`
+#'   attribute -- a tibble with columns `origin` (character) and `action`
+#'   (character: `"kept"` or `"deleted"`).
+#'   When `dry_run = TRUE`: the summary tibble directly.
+#'
+#' @export
+ragnar_store_sync <- function(
+  store,
+  keep,
+  dry_run       = FALSE,
+  rebuild_index = TRUE
+) {
+  stopifnot(S7::S7_inherits(store, DuckDBRagnarStore))
+  if (store@version != 2L) {
+    rlang::abort(
+      "`ragnar_store_sync()` only supports version 2 stores.",
+      call = NULL
+    )
+  }
+  check_character(keep, allow_na = FALSE)
+  check_bool(dry_run)
+  check_bool(rebuild_index)
+
+  con <- store@con
+
+  # Identify all current origins and classify as kept or deleted
+  keep_df <- tibble::tibble(origin = unique(as.character(keep)))
+  local_duckdb_register(con, "origins_to_keep", keep_df)
+
+  summary <- DBI::dbGetQuery(
+    con,
+    "
+    SELECT
+      d.origin,
+      CASE WHEN k.origin IS NOT NULL THEN 'kept' ELSE 'deleted' END AS action
+    FROM documents d
+    LEFT JOIN origins_to_keep k USING(origin)
+    ORDER BY action, d.origin
+    "
+  )
+  summary <- tibble::as_tibble(summary)
+
+  if (dry_run) {
+    return(summary)
+  }
+
+  to_delete <- summary$origin[summary$action == "deleted"]
+
+  if (length(to_delete)) {
+    to_delete_df <- tibble::tibble(origin = to_delete)
+    local_duckdb_register(con, "origins_to_delete", to_delete_df)
+
+    # Both deletes are wrapped in a single transaction for atomicity:
+    # either all stale origins are removed or none are. Embeddings must be
+    # deleted before documents because the embeddings table references doc_id
+    # (enforced by application code; DuckDB 1.x lacks deferred FK checking).
+    dbWithTransaction2(con, {
+      DBI::dbExecute(
+        con,
+        "
+        DELETE FROM embeddings
+        WHERE doc_id IN (
+          SELECT doc_id FROM documents
+          WHERE origin IN (SELECT origin FROM origins_to_delete)
+        )
+        "
+      )
+      DBI::dbExecute(
+        con,
+        "DELETE FROM documents
+         WHERE origin IN (SELECT origin FROM origins_to_delete)"
+      )
+    })
+  }
+
+  if (rebuild_index && length(to_delete)) {
+    ragnar_store_build_index(store)
+  }
+
+  attr(store, "sync_summary") <- summary
+  invisible(store)
+}
+
+#' Audit a Ragnar store against an expected set of URLs
+#'
+#' `ragnar_store_audit()` checks which URLs from an expected set are present in
+#' the store's `documents` table. Use it to verify that all pages were
+#' successfully ingested after a [ragnar_store_ingest()] run.
+#'
+#' @param store A `DuckDBRagnarStore` (version 2 only).
+#' @param expected A character vector or [`ragnar_links`][ragnar_find_links()]
+#'   object of URLs or file paths to check, or a data frame with a character
+#'   column named `source` containing those origins.
+#' @param group_by Optional name of a column in `expected` to group by. It must
+#'   differ from the summary column names below. The default, `NULL`, reports
+#'   totals for the full expected set.
+#'
+#' @returns A tibble with one row, or one row per group when `group_by` is set,
+#'   with columns:
+#'   - The grouping column, when requested, in order of first appearance.
+#'   - `expected` (integer): number of distinct expected origins.
+#'   - `ingested` (integer): number of expected origins present in the store.
+#'   - `missing` (integer): number of expected origins absent from the store.
+#'   - `chunks` (integer): total stored chunks for the expected origins.
+#'   - `missing_urls` (list): a character vector of missing origins for each row,
+#'     or `character()` when all expected origins are present.
+#'
+#'   Duplicate origins are counted once per group. Origins stored outside the
+#'   expected set are excluded. Empty ungrouped input returns one row of zero
+#'   counts; empty grouped input returns zero rows. Read-only connections are
+#'   supported.
+#'
+#' @export
+ragnar_store_audit <- function(store, expected, group_by = NULL) {
+  stopifnot(S7::S7_inherits(store, DuckDBRagnarStore))
+  if (store@version != 2L) {
+    rlang::abort(
+      "`ragnar_store_audit()` only supports version 2 stores.",
+      call = NULL
+    )
+  }
+  if (!is.data.frame(expected)) {
+    check_character(expected, allow_na = FALSE)
+    expected <- tibble::tibble(source = as.character(expected))
+  }
+  stopifnot("source" %in% names(expected))
+  check_character(expected$source, allow_na = FALSE)
+  check_string(group_by, allow_null = TRUE)
+  if (!is.null(group_by)) {
+    if (!group_by %in% names(expected)) {
+      cli::cli_abort(
+        "Grouping column {.val {group_by}} is absent from {.arg expected}."
+      )
+    }
+    if (
+      group_by %in% c("expected", "ingested", "missing", "chunks", "missing_urls")
+    ) {
+      cli::cli_abort("{.arg group_by} must differ from the summary column names.")
+    }
+  }
+  origins <- tibble::tibble(.origin = as.character(expected$source))
+  if (!is.null(group_by)) {
+    origins$.group <- expected[[group_by]]
+  }
+  origins <- distinct(origins)
+
+  con <- store@con
+
+  expected_df <- tibble::tibble(origin = unique(origins$.origin))
+  local_duckdb_register(con, "audit_expected", expected_df)
+
+  result <- DBI::dbGetQuery(
+    con,
+    "
+    SELECT
+      e.origin,
+      d.origin IS NOT NULL AS present,
+      CAST(COUNT(em.doc_id) AS INTEGER) AS chunks
+    FROM audit_expected e
+    LEFT JOIN documents d USING(origin)
+    LEFT JOIN embeddings em ON em.doc_id = d.doc_id
+    GROUP BY e.origin, d.origin
+    "
+  )
+
+  i <- match(origins$.origin, result$origin)
+  origins$.present <- result$present[i]
+  origins$.chunks <- result$chunks[i]
+  result <- origins |>
+    dplyr::summarise(
+      expected = dplyr::n(),
+      ingested = sum(.data$.present),
+      missing = sum(!.data$.present),
+      chunks = sum(.data$.chunks),
+      missing_urls = list(.data$.origin[!.data$.present]),
+      .by = any_of(".group")
+    )
+  if (!is.null(group_by)) {
+    names(result)[[1L]] <- group_by
+  }
+  result
 }
 
 #' Build a Ragnar Store index
@@ -446,17 +682,17 @@ ragnar_store_inspect <- function(store, ...) {
 #' @param launch.browser Whether to launch the browser automatically.
 #'
 #' @note This function requires the `embedding-atlas` Python package (>= 0.20.0)
-#' in your reticulate Python environment, the `duckdb` R package (>= 1.4.0),
+#' in your reticulate Python environment, the `duckdb` R package (>= 1.5.0),
 #' and `nanoarrow` (>= 0.8.0) to transfer data from the DuckDB store to Python.
 #'
 #' @examples
 #' \dontrun{
 #' # Start Ollama, then run this in a terminal:
-#' # ollama pull embeddinggemma:300m-qat-q4_0
+#' # ollama pull embeddinggemma-2:270m-q8_0-text
 #'
 #' # Create an in-memory store using local embeddings
 #' store <- ragnar_store_create(
-#'   embed = embed_ollama(model = "embeddinggemma:300m-qat-q4_0")
+#'   embed = embed_ollama()
 #' )
 #'
 #' # Read and embed a chapter from R for Data Science

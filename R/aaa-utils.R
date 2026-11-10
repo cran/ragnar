@@ -1,5 +1,5 @@
 #' @importFrom rvest html_text html_text2 html_elements read_html html_attr
-#' @importFrom stringi stri_c stri_count_fixed stri_detect_fixed
+#' @importFrom stringi stri_c stri_count_fixed stri_detect_fixed stri_detect_regex
 #'   stri_endswith_fixed stri_extract_first_regex stri_extract_last_regex
 #'   stri_flatten stri_length stri_locate_all_boundaries stri_locate_all_fixed
 #'   stri_locate_first_regex stri_match_first_regex stri_numbytes
@@ -132,12 +132,13 @@ capture_args <- function(omit_default_values = TRUE) {
 
   if (omit_default_values) {
     default_args <- as.list(formals(fn))[names(args)]
+    default_args <- default_args[!map_lgl(default_args, is_missing)]
     default_args <- lapply(
       default_args,
       eval,
       envir = new.env(parent = environment(fn))
     )
-    for (nm in names(args)) {
+    for (nm in names(default_args)) {
       if (identical(default_args[[nm]], args[[nm]])) args[[nm]] <- NULL
     }
   }
@@ -145,8 +146,9 @@ capture_args <- function(omit_default_values = TRUE) {
   args
 }
 
-partial <- function(.fn, .sig, ...) {
-  body <- as.call(c(.fn, lapply(names(.sig), as.symbol), ...))
+partial <- function(.fn, .sig, args) {
+  args[names(.sig)] <- NULL
+  body <- as.call(c(.fn, lapply(names(.sig), as.symbol), args))
   as.function.default(c(.sig, body), envir = baseenv())
 }
 
@@ -160,6 +162,9 @@ reorder_by_names <- function(object, to_front, to_back = NULL) {
 
 is_windows <- function() identical(.Platform$OS.type, "windows")
 
+is_windows_arm64 <- function() {
+  is_windows() && R.version$arch %in% c("aarch64", "arm64")
+}
 
 prepend <- function(body, head) c(head, body)
 
@@ -300,6 +305,7 @@ can_load_duckdb_extensions <- local({
   # be loaded in a separate process and proceed if that's possible.
   can <- NULL
   function() {
+    if (is_windows_arm64()) return(FALSE)
     if (is.null(can)) {
       can <<- 0L ==
         system2(

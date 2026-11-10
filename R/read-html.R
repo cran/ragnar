@@ -1,4 +1,4 @@
-#' Read text from an html doc
+# ' Read text from an html doc
 #'
 #' This builds upon `rvest::html_text2()` by adding support for splitting the returned
 #' vector at the locations of requested nodes.
@@ -351,23 +351,73 @@ ragnar_read_document <- function(
 #'   subset them to return a smaller list. This can be useful for filtering out
 #'   URL's by rules different than `children_only` which only checks the prefix.
 #'
-#' @param validate Default is `FALSE`. If `TRUE` sends a `HEAD` request for each
-#'   link and removes those that are not accessible. Requests are sent in parallel
-#'   using [httr2::req_perform_parallel()].
+#' @param validate Default is `FALSE`. If `TRUE`, checks that local files exist
+#'   and sends a `HEAD` request for each remote link, removing those that are not
+#'   accessible. Requests are sent in parallel using [httr2::req_perform_parallel()].
 #'
-#' @return A character vector of links on the page.
+#' @param get_timestamps Default is `FALSE`. If `TRUE`, sends parallel `HEAD`
+#'   requests for any discovered URLs that were not visited during crawling, and
+#'   records their `Last-Modified` response header. Sitemap `<lastmod>` dates and
+#'   datetimes are recorded without extra requests; only missing or invalid
+#'   sitemap dates need `HEAD` requests. Pages fetched during crawling use the
+#'   `GET` response header when present and retain their sitemap date otherwise.
+#'   Useful for incremental ingest: callers can skip re-fetching pages whose
+#'   timestamp has not changed since the last run. Note that not all hosting
+#'   platforms set `Last-Modified`; S3-backed sites (including many
+#'   `docs.posit.co` pages) and GitHub Pages do, while Netlify-hosted sites
+#'   (e.g. `quarto.org`) do not. Missing headers and local file timestamps are
+#'   recorded as `NA`.
+#'
+#' @param include_root Default is `FALSE`. If `TRUE`, also includes the starting
+#'   page in the results, subject to `children_only`, `url_filter`, and `validate`.
+#'   Sitemap inputs contribute only their listed URLs. If `FALSE`, the starting
+#'   page can still be returned when it is found through a link.
+#'
+#' @param metadata Default is `FALSE`. If `TRUE`, returns a tibble with a
+#'   character `source` column and a `POSIXct` `last_modified` column, with one
+#'   row per returned link. Missing timestamps are `NA`. This does not request
+#'   additional timestamps; use `get_timestamps = TRUE` for that.
+#'
+#' @return By default, a `ragnar_links` object: a character vector of URLs, sorted
+#'   alphabetically and deduplicated, with the following attributes:
+#'   \describe{
+#'     \item{`last_modified`}{A named `POSIXct` vector of timestamps from response
+#'       headers and sitemap entries. Always present. URLs without a known
+#'       timestamp are `NA` or absent from this vector; `metadata = TRUE` gives
+#'       every returned link a row with `NA` for an unknown timestamp.}
+#'     \item{`problems`}{A data frame with columns `link` and `problem`,
+#'       present when a link could not be fetched or validated, or a sitemap
+#'       entry lacks an absolute HTTP(S) URL.}
+#'   }
+#'   Joins and row-binding combine links as ordinary character vectors. To keep
+#'   timestamps in the combined data, use `metadata = TRUE`. This returns a tibble
+#'   with `source` and `last_modified` columns in the same order as the default
+#'   vector. Both return types retain the `problems` attribute when present,
+#'   including problems for links excluded from the results.
 #' @export
 #'
 #' @examples
 #' \dontrun{
 #' ragnar_find_links("https://r4ds.hadley.nz/base-R.html")
 #' ragnar_find_links("https://ellmer.tidyverse.org/")
+#' # Include the starting page when collecting documents for ingestion
+#' ragnar_find_links("https://ellmer.tidyverse.org/", include_root = TRUE)
 #' ragnar_find_links(
 #'   paste0("https://github.com/Snowflake-Labs/sfquickstarts/",
 #'          "tree/master/site/sfguides/src/build_a_custom_model_for_anomaly_detection"),
 #'   children_only = "https://github.com/Snowflake-Labs/sfquickstarts",
 #'   depth = 1
 #' )
+#'
+#' # Retrieve Last-Modified timestamps for all discovered URLs
+#' links <- ragnar_find_links(
+#'   "https://docs.posit.co/",
+#'   children_only = TRUE,
+#'   depth = 1,
+#'   get_timestamps = TRUE,
+#'   metadata = TRUE
+#' )
+#' links$last_modified
 #' }
 ragnar_find_links <- function(
   x,
@@ -376,12 +426,20 @@ ragnar_find_links <- function(
   progress = TRUE,
   ...,
   url_filter = identity,
-  validate = FALSE
+  validate = FALSE,
+  get_timestamps = FALSE,
+  include_root = FALSE,
+  metadata = FALSE
 ) {
   rlang::check_dots_empty()
+  stopifnot(is.logical(include_root), length(include_root) == 1L, !is.na(include_root))
+  stopifnot(is.logical(metadata), length(metadata) == 1L, !is.na(metadata))
 
-  if (!inherits(x, "xml_node")) {
+  if (inherits(x, "xml_node")) {
+    requested_url <- xml_url2(x)
+  } else {
     check_string(x)
+    requested_url <- url_normalize(x)
     x <- read_html2(x)
   }
 
@@ -407,11 +465,20 @@ ragnar_find_links <- function(
 
   deque <- reticulate::import("collections")$deque()
   visited <- reticulate::import_builtins()$set()
+  queued <- reticulate::import_builtins()$set()
   resolved <- reticulate::dict()
   collected <- reticulate::import_builtins()$set()
   problems <- list()
+  last_modified <- list()
 
-  deque$append(list(url = xml_url2(x), depth = 0))
+  start_url <- xml_url2(x)
+  resolved[requested_url] <- start_url
+  deque$append(list(url = start_url, depth = 0))
+  queued$add(requested_url)
+  queued$add(start_url)
+  if (include_root && !is_sitemap(x)) {
+    collected$add(start_url)
+  }
   if (!depth) {
     progress <- FALSE
   }
@@ -434,12 +501,19 @@ ragnar_find_links <- function(
         }
 
         visited$add(item$url)
-        links <- tryCatch(
+        page_result <- tryCatch(
           {
             page <- read_html2(item$url)
             resolved_url <- xml_url2(page) # maybe redirected
             resolved[item$url] <- resolved_url
-            html_find_links(page)
+            found_links <- html_find_links(page)
+            list(
+              links = found_links,
+              resolved_url = resolved_url,
+              last_modified = attr(page, "last_modified", exact = TRUE) %||% .POSIXct(NA_real_),
+              link_lastmod = attr(found_links, "lastmod", exact = TRUE),
+              bad_locs = attr(found_links, "bad_locs", exact = TRUE)
+            )
           },
 
           error = function(e) {
@@ -450,18 +524,56 @@ ragnar_find_links <- function(
               problem = conditionMessage(e)
             )
             resolved[item$url] <- ""
-            character(0)
+            list(links = character(0), resolved_url = NULL, last_modified = NULL, link_lastmod = NULL, bad_locs = NULL)
           }
         )
+        if (!is.null(page_result$resolved_url)) {
+          # Prefer the response header, retaining sitemap dates across redirects.
+          timestamps <- c(
+            page_result$last_modified,
+            last_modified[[page_result$resolved_url]],
+            last_modified[[item$url]]
+          )
+          last_modified[[page_result$resolved_url]] <- timestamps[!is.na(timestamps)][1L]
+        }
+        if (!is.null(page_result$link_lastmod)) {
+          # Missing sitemap dates still need the normal HEAD request path.
+          lm_map <- as.list(
+            page_result$link_lastmod[!is.na(page_result$link_lastmod)]
+          )
+          # Use the same resolved URLs as result collection, including redirects
+          # visited before this sitemap was discovered.
+          redirects <- unlist(reticulate::py_to_r(resolved), use.names = TRUE)
+          destinations <- redirects[names(lm_map)]
+          redirected <- !is.na(destinations) & nzchar(destinations)
+          names(lm_map)[redirected] <- destinations[redirected]
+          lm_map <- lm_map[!duplicated(names(lm_map))]
+          # Fill missing dates in a batch, preserving known response timestamps.
+          known <- names(last_modified)[
+            !vapply(last_modified, is.na, logical(1))
+          ]
+          lm_map <- lm_map[!names(lm_map) %in% known]
+          last_modified[names(lm_map)] <- lm_map
+        }
+        if (length(page_result$bad_locs)) {
+          for (bad in page_result$bad_locs) {
+            problems[[length(problems) + 1]] <- list(
+              link = bad,
+              problem = paste0("Sitemap <loc> is not a valid HTTP URL: ", bad)
+            )
+          }
+        }
+        links <- page_result$links
 
         links <- url_filter_fn(links)
 
         # If depth still supports, we add items to the deque if they are not yet
-        # visited.
+        # visited or already queued.
         if (item$depth + 1 <= depth) {
           for (link in links) {
-            if (!visited$`__contains__`(link)) {
+            if (!visited$`__contains__`(link) && !queued$`__contains__`(link)) {
               deque$append(list(url = link, depth = item$depth + 1))
+              queued$add(link)
             }
           }
         }
@@ -480,25 +592,48 @@ ragnar_find_links <- function(
   out <- collected
   get_resolved <- reticulate::py_to_r(resolved$get)
   out <- reticulate::iterate(out, \(x) get_resolved(x) %||% x)
+  out <- as.character(out)
   out <- out[nzchar(out)]
   out <- unique(sort(url_filter_fn(out)))
 
-  # Validate that we can acess all the URL's
+  head_resps <- list()
+  # Validate local files through the filesystem and remote links with HEAD.
   if (validate) {
-    resps <- out |>
+    urls <- out[is_url(out)]
+    paths <- out[!is_url(out)]
+    path_results <- lapply(paths, \(path) {
+      tryCatch({
+        if (grepl("^file://", path, ignore.case = TRUE)) {
+          path <- curl::curl_parse_url(path)$path
+          # Windows file URIs can prefix a drive letter with /.
+          path <- sub("^/([A-Za-z]:/)", "\\1", path)
+        }
+        if (!file.exists(path)) {
+          stop("File does not exist", call. = FALSE)
+        }
+        TRUE
+      }, error = identity)
+    })
+    paths_ok <- map_lgl(path_results, isTRUE)
+    resps <- urls |>
       lapply(\(url) url |> httr2::request() |> httr2::req_method("HEAD")) |>
       httr2::req_perform_parallel(on_error = "continue")
 
     is_ok <- resps |>
       map_lgl(\(x) inherits(x, "httr2_response"))
 
-    errors <- map2(out[!is_ok], resps[!is_ok], function(url, err) {
-      list(url = url, err = conditionMessage(err))
+    errors <- map2(urls[!is_ok], resps[!is_ok], function(url, err) {
+      list(link = url, problem = conditionMessage(err))
     })
+    errors <- c(errors, map2(paths[!paths_ok], path_results[!paths_ok], \(path, err) {
+      list(link = path, problem = conditionMessage(err))
+    }))
 
     problems <- c(problems, errors)
 
-    out <- out[is_ok]
+    out <- setdiff(out, c(paths[!paths_ok], urls[!is_ok]))
+    head_resps <- resps[is_ok]
+    names(head_resps) <- urls[is_ok]
   }
 
   if (length(problems)) {
@@ -508,7 +643,121 @@ ragnar_find_links <- function(
     attr(out, "problems") <- dplyr::bind_rows(problems)
   }
 
+  if (get_timestamps) {
+    unvisited <- setdiff(out, names(last_modified))
+    if (length(unvisited)) {
+      need_head <- setdiff(unvisited[is_url(unvisited)], names(head_resps))
+      if (length(need_head)) {
+        head_resps[need_head] <- need_head |>
+          lapply(\(url) {
+            httr2::request(url) |>
+              httr2::req_method("HEAD") |>
+              httr2::req_timeout(10) |>
+              httr2::req_error(is_error = \(resp) FALSE)
+          }) |>
+          httr2::req_perform_parallel(on_error = "continue")
+      }
+      for (url in unvisited) {
+        resp <- head_resps[[url]]
+        ts <- if (inherits(resp, "httr2_response") && !httr2::resp_is_error(resp)) {
+          raw <- httr2::resp_header(resp, "Last-Modified", default = NA)
+          if (!is.na(raw)) {
+            tryCatch(
+              withr::with_locale(
+                c(LC_TIME = "C"),
+                as.POSIXct(raw, format = "%a, %d %b %Y %H:%M:%S", tz = "GMT")
+              ),
+              error = \(e) .POSIXct(NA_real_)
+            )
+          } else {
+            .POSIXct(NA_real_)
+          }
+        } else {
+          .POSIXct(NA_real_)
+        }
+        last_modified[[url]] <- ts
+      }
+    }
+  }
+
+  if (length(last_modified)) {
+    lm_vec <- do.call(c, last_modified)
+    attr(out, "last_modified") <- lm_vec[order(names(lm_vec))]
+  } else {
+    attr(out, "last_modified") <- structure(
+      numeric(0), class = c("POSIXct", "POSIXt"), names = character(0)
+    )
+  }
+
+  if (metadata) {
+    rows <- tibble(
+      source = as.character(out),
+      last_modified = .POSIXct(
+        as.numeric(attr(out, "last_modified")[out]), tz = "UTC"
+      )
+    )
+    attr(rows, "problems") <- attr(out, "problems")
+    return(rows)
+  }
+
+  class(out) <- c("ragnar_links", "character")
   out
+}
+
+
+# Crawl metadata describes the original crawl, not a combined URL column.
+#' @exportS3Method vctrs::vec_ptype2
+vec_ptype2.ragnar_links.ragnar_links <- function(x, y, ...) character()
+
+#' @exportS3Method vctrs::vec_ptype2
+vec_ptype2.ragnar_links.character <- function(x, y, ...) character()
+
+#' @exportS3Method vctrs::vec_ptype2
+vec_ptype2.character.ragnar_links <- function(x, y, ...) character()
+
+#' @exportS3Method vctrs::vec_cast
+vec_cast.character.ragnar_links <- function(x, to, ...) vctrs::vec_data(x)
+
+
+#' @export
+print.ragnar_links <- function(x, n = 10L, ...) {
+  n_total <- length(x)
+  cat(sprintf("# A ragnar_links vector: %d URL%s\n", n_total, if (n_total == 1L) "" else "s"))
+
+  if (n_total > 0L) {
+    lm <- attr(x, "last_modified", exact = TRUE)
+    shown <- min(n, n_total)
+    idx <- seq_len(shown)
+
+    shown_urls <- unclass(x)[idx]
+    if (!is.null(lm)) {
+      df <- data.frame(
+        url = shown_urls,
+        last_modified = format(lm[shown_urls]),
+        stringsAsFactors = FALSE,
+        row.names = idx
+      )
+    } else {
+      df <- data.frame(
+        url = shown_urls,
+        stringsAsFactors = FALSE,
+        row.names = idx
+      )
+    }
+    print(df, right = FALSE)
+
+    if (n_total > shown) {
+      cat(sprintf("# ... with %d more row%s\n", n_total - shown, if (n_total - shown == 1L) "" else "s"))
+    }
+  }
+
+  problems <- attr(x, "problems", exact = TRUE)
+  if (!is.null(problems) && nrow(problems) > 0L) {
+    cat("#\n# Problems:\n")
+    print(problems, right = FALSE)
+  }
+
+  invisible(x)
 }
 
 
@@ -520,25 +769,67 @@ html_find_links <- function(x, absolute = TRUE) {
     x <- read_html2(x)
   }
 
+  sitemap_lastmod <- NULL
   links <- if (is_sitemap(x)) {
-    x |>
-      xml2::xml_ns_strip() |>
-      xml2::xml_find_all("//urlset/url/loc", flatten = TRUE) |>
-      xml2::xml_text()
+    url_nodes <- x |>
+      xml2::xml_find_all(
+        "//*[local-name() = 'urlset']/*[local-name() = 'url']"
+      )
+    locs <- url_nodes |>
+      xml2::xml_find_first("*[local-name() = 'loc']") |>
+      xml2::xml_text(trim = TRUE)
+    lastmod_text <- url_nodes |>
+      xml2::xml_find_first("*[local-name() = 'lastmod']") |>
+      xml2::xml_text(trim = TRUE)
+    date_only <- grepl("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", lastmod_text)
+    datetime <- grepl(
+      "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      lastmod_text
+    )
+    lastmod_text[!date_only & !datetime] <- NA_character_
+    lastmod_text[date_only] <- paste0(lastmod_text[date_only], "T00:00:00Z")
+    lastmod_text <- sub("(T[0-9]{2}:[0-9]{2})(Z|[+-])", "\\1:00\\2", lastmod_text)
+    lastmod_text <- sub("Z$", "+0000", lastmod_text)
+    lastmod_text <- sub("([+-][0-9]{2}):([0-9]{2})$", "\\1\\2", lastmod_text)
+    sitemap_lastmod <- as.POSIXct(
+      lastmod_text, format = "%Y-%m-%dT%H:%M:%OS%z", tz = "UTC"
+    )
+    names(sitemap_lastmod) <- url_normalize(locs)
+    # Keep the first known date when multiple locations normalize to one URL.
+    sitemap_lastmod <- sitemap_lastmod[!is.na(sitemap_lastmod)]
+    sitemap_lastmod <- sitemap_lastmod[!duplicated(names(sitemap_lastmod))]
+    valid <- !is.na(locs) & grepl("^https?://", locs, ignore.case = TRUE)
+    bad <- locs[!valid]
+    good <- locs[valid]
+    attr(good, "bad_locs") <- bad
+    good
   } else {
     x |>
       xml_find_all(".//a[@href]") |>
       xml_attr("href", default = "")
   }
 
+  # Save bad_locs before filtering strips the attribute
+  bad_locs <- attr(links, "bad_locs")
+
   # Canonicalize links
   links <- stri_extract_first_regex(links, "^[^#]*") # strip section links
   links <- links[!links %in% c("", "/", "./", "./index.html")] # remove self links
-  links <- stri_replace_last_regex(links, "/$", "") # strip trailing /
+  # Strip links to source files (e.g. .md source files served alongside HTML)
+  links <- links[!stri_detect_regex(links, "\\.md$")]
   links <- sort(unique(links))
 
   if (absolute) {
+    # Repeated path segments can be valid, e.g. GitHub owner/repository URLs.
     links <- url_absolute2(links, xml_url2(x))
+  }
+
+  if (!is.null(sitemap_lastmod)) {
+    attr(links, "lastmod") <- sitemap_lastmod[links]
+  }
+
+  if (length(bad_locs)) {
+    attr(links, "bad_locs") <- bad_locs
   }
 
   links
@@ -546,8 +837,9 @@ html_find_links <- function(x, absolute = TRUE) {
 
 is_sitemap <- function(x) {
   has_sitemap <- x |>
-    xml2::xml_ns_strip() |>
-    xml2::xml_find_first("//sitemapindex | //urlset")
+    xml2::xml_find_first(
+      "//*[local-name() = 'sitemapindex' or local-name() = 'urlset']"
+    )
   length(has_sitemap) > 0
 }
 
@@ -568,16 +860,15 @@ url_absolute2 <- function(urls, baseurl) {
   # https://docs.posit.co/drivers/2024.03.0/pdf/Simba Teradata ODBC Connector Install and Configuration Guide.pdf
   na_links <- is.na(links)
   links[na_links] <- urls[na_links]
-  links
+  url_normalize(links)
 }
 
 url_normalize_stem <- function(url) {
   check_string(url)
-  # if (endsWith(url, "index.html")) {
-  #   dirname(dirname(url))
-  # } else
-  if (endsWith(url, ".html")) {
-    dirname(url)
+  if (endsWith(url, "/index.html")) {
+    sub("index\\.html$", "", url)
+  } else if (endsWith(url, ".html")) {
+    sub("\\.html$", "", url)
   } else {
     url
   }
@@ -588,11 +879,16 @@ stri_subset_startswith_fixed <- function(str, pattern, ...) {
 }
 
 # workaround for https://github.com/r-lib/xml2/issues/453
-read_html2 <- function(url, ...) {
+read_html2 <- function(url, ..., redirect_chain = character()) {
   # For some reason curl is both erroring and warning when the URL is invalid or
   # returns 404. We don't really want the warnings, so we discard them.
   if (!is_url(url)) {
-    return(xml2::read_html(url, ...))
+    out <- xml2::read_html(url, ...)
+    # Ensure resolved_url is an absolute path, not a file:// URI
+    # (xml2::xml_url() returns file:// URIs on macOS/Windows, which don't
+    # compare equal to plain paths used as start_url)
+    attr(out, "resolved_url") <- normalizePath(url, winslash = "/", mustWork = TRUE)
+    return(out)
   }
   suppressWarnings({
     handle <- curl::new_handle(followlocation = TRUE)
@@ -613,14 +909,71 @@ read_html2 <- function(url, ...) {
   })
   on.exit(tryCatch(close(conn), error = function(e) NULL))
   out <- xml2::read_html(conn, ...)
-  attr(out, "resolved_url") <- curl::handle_data(handle)$url
+  hdata <- curl::handle_data(handle)
+  attr(out, "resolved_url") <- hdata$url
+  attr(out, "last_modified") <- hdata$modified %||% .POSIXct(NA_real_)
+
+  # Some sites (e.g. docs.posit.co) serve JS-only redirect pages that curl
+  # cannot follow. Detect the pattern and re-fetch the redirect target.
+  out <- follow_js_redirect(
+    out,
+    ...,
+    redirect_chain = c(redirect_chain, url, hdata$url)
+  )
+
   out
 }
 
+# Detect and follow JS redirect pages of the form:
+#   var redirects = {"": "../some/path.html"};  window.location.replace(redirect)
+# These are static files that redirect browsers but have no <a> links, so
+# curl lands on a blank page. We parse the redirect target and re-fetch.
+follow_js_redirect <- function(doc, ..., redirect_chain) {
+  script_text <- doc |>
+    xml2::xml_find_first(".//script[contains(., 'redirects')]") |>
+    xml2::xml_text()
+  if (is.na(script_text)) {
+    return(doc)
+  }
+  if (!grepl("window\\.location\\.replace", script_text)) {
+    return(doc)
+  }
+
+  # Extract only the default entry: crawling strips fragments from links.
+  # Supported forms are {"": "TARGET"} and {"": 'TARGET'}.
+  m <- regmatches(
+    script_text,
+    regexpr('""\\s*:\\s*["\']([^"\']+)["\']', script_text, perl = TRUE)
+  )
+  if (!length(m)) {
+    return(doc)
+  }
+  target <- sub('^""\\s*:\\s*["\']([^"\']+)["\']$', "\\1", m)
+
+  base_url <- attr(doc, "resolved_url", exact = TRUE) %||% xml2::xml_url(doc)
+  redirect_url <- xml2::url_absolute(target, base_url)
+
+  if (redirect_url %in% redirect_chain) {
+    cli::cli_abort("JavaScript redirect cycle at {.url {redirect_url}}.")
+  }
+
+  read_html2(redirect_url, ..., redirect_chain = redirect_chain)
+}
+
 is_url <- function(path) {
-  grepl("^(http|ftp)s?://", path)
+  grepl("^(http|ftp)s?://", path, ignore.case = TRUE)
+}
+
+url_normalize <- function(urls) {
+  remote <- is_url(urls)
+  urls[remote] <- stri_extract_first_regex(urls[remote], "^[^#]*")
+  # HTTP requests use / for an empty path; slashes in other paths are meaningful.
+  urls[remote] <- sub(
+    "^(https?://[^/?]+)(\\?|$)", "\\1/\\2", urls[remote], ignore.case = TRUE
+  )
+  urls
 }
 
 xml_url2 <- function(x) {
-  attr(x, "resolved_url", TRUE) %||% xml2::xml_url(x)
+  url_normalize(attr(x, "resolved_url", TRUE) %||% xml2::xml_url(x))
 }

@@ -180,6 +180,9 @@ read_as_markdown <- function(
   html_zap_selectors = c("nav"),
   youtube_transcript_formatter = NULL
 ) {
+  if (is_windows_arm64()) {
+    stop("MarkItDown is not currently supported on Windows ARM64.", call. = FALSE)
+  }
   check_string(path)
   check_string(origin, allow_na = TRUE)
   if (startsWith(path, "~")) {
@@ -299,7 +302,7 @@ cli_markitdown <- function(args, ...) {
 
 #' View chunks with the store inspector
 #'
-#' Visualize chunks read by [ragnar_read()] for quick inspection.
+#' Visualize chunks produced by [markdown_chunk()] for quick inspection.
 #' Helpful for inspecting the results of chunking and reading while iterating
 #' on the ingestion pipeline.
 #'
